@@ -1,0 +1,317 @@
+/**
+ * Configuration resolution.
+ *
+ * Precedence (highest wins):
+ *   1. `OTEL_*` / `PI_OTEL_*` environment variables
+ *   2. project `.pi/settings.json` -> `otel`
+ *   3. global `~/.pi/agent/settings.json` -> `otel`
+ *
+ * Standard OTel SDK env vars are honored verbatim so existing instrumentation
+ * config keeps working. `PI_OTEL_*` covers extension-specific concerns.
+ */
+
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { DiagLogLevel } from "@opentelemetry/api";
+import type { ContentCapture } from "./attrs.js";
+
+export type Protocol = "grpc" | "http/protobuf" | "http/json";
+
+export type ExporterToken = "otlp" | "console" | "none";
+
+export interface SignalConfig {
+  enabled: boolean;
+}
+
+export interface ResolvedConfig {
+  /** Master kill switch. When false the extension is inert. */
+  enabled: boolean;
+  /** Base OTLP endpoint, e.g. http://localhost:4318 or https://ingest.host.com. */
+  endpoint: string;
+  /** Per-signal endpoint overrides (already resolved, or derived from base). */
+  tracesEndpoint: string;
+  metricsEndpoint: string;
+  logsEndpoint: string;
+  /** Wire protocol for all signals. */
+  protocol: Protocol;
+  /** Headers sent on every export (auth, etc.). */
+  headers: Record<string, string>;
+  /** `service.name` resource attribute (required by spec). */
+  serviceName: string;
+  /** Additional resource attributes from OTEL_RESOURCE_ATTRIBUTES. */
+  resourceAttributes: Record<string, string>;
+  /** Raw content capture level. Default `full`. */
+  captureContent: ContentCapture;
+  /** Head-sampling ratio in [0,1]. Default 1.0 (no sampling). */
+  sampleRatio: number;
+  /** Metric export interval, ms. */
+  metricExportInterval: number;
+  /** Per-signal exporter token lists (order preserved, deduped). */
+  tracesExporters: ExporterToken[];
+  metricsExporters: ExporterToken[];
+  logsExporters: ExporterToken[];
+  /** Traces periodic export interval, ms. */
+  tracesExportInterval: number;
+  /** Logs periodic export interval, ms. */
+  logsExportInterval: number;
+  /** Per-signal toggles. */
+  traces: SignalConfig;
+  metrics: SignalConfig;
+  logs: SignalConfig;
+  /** OTel diag log level (internal SDK diagnostics). Default NONE. */
+  diagLogLevel: DiagLogLevel;
+  /** Emit telemetry from the extension itself (lifecycle events as logs). */
+  selfLogs: boolean;
+  /** Shutdown timeout in ms. forceFlush+shutdown race against this. Default 2000. */
+  shutdownTimeoutMs: number;
+  /** Working directory, for the pi.cwd resource attribute. */
+  cwd: string;
+}
+
+interface SettingsFile {
+  otel?: Partial<SettingsOtel>;
+}
+interface SettingsOtel {
+  enabled: boolean;
+  endpoint: string;
+  tracesEndpoint: string;
+  metricsEndpoint: string;
+  logsEndpoint: string;
+  protocol: Protocol;
+  headers: Record<string, string>;
+  serviceName: string;
+  resourceAttributes: Record<string, string>;
+  captureContent: ContentCapture;
+  sampleRatio: number;
+  metricExportInterval: number;
+  tracesExporters?: string[];
+  metricsExporters?: string[];
+  logsExporters?: string[];
+  tracesExportInterval?: number;
+  logsExportInterval?: number;
+  traces: boolean;
+  metrics: boolean;
+  logs: boolean;
+  diagLogLevel: string;
+  selfLogs: boolean;
+  shutdownTimeoutMs: number;
+}
+
+function readJson(path: string): SettingsFile | null {
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as SettingsFile;
+  } catch {
+    return null;
+  }
+}
+
+/** Parse `k=v,k=v` lists per the W3C OTel env var spec (URL-decoded). */
+function parseKv(raw: string | undefined, decode = false): Record<string, string> {
+  if (!raw) return {};
+  const out: Record<string, string> = {};
+  for (const pair of raw.split(",")) {
+    const eq = pair.indexOf("=");
+    if (eq <= 0) continue;
+    const k = pair.slice(0, eq).trim();
+    if (!k) continue;
+    const rawV = pair.slice(eq + 1).trim();
+    let v = rawV;
+    if (decode) {
+      try {
+        v = decodeURIComponent(rawV);
+      } catch {
+        v = rawV; // malformed %-escape — keep raw per W3C guidance
+      }
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
+function envStr(...names: string[]): string | undefined {
+  for (const n of names) {
+    const v = process.env[n];
+    if (v !== undefined && v.trim() !== "") return v.trim();
+  }
+  return undefined;
+}
+
+function envBool(names: string[], fallback: boolean): boolean {
+  const v = envStr(...names);
+  if (v === undefined) return fallback;
+  return v === "1" || v.toLowerCase() === "true" || v.toLowerCase() === "yes";
+}
+
+function envNum(names: string[], fallback: number): number {
+  const v = envStr(...names);
+  if (v === undefined) return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+const EXPORTER_TOKENS: ReadonlySet<string> = new Set(["otlp", "console", "none"]);
+
+function dedupeValidExporterParts(parts: string[]): ExporterToken[] {
+  const out: ExporterToken[] = [];
+  const seen = new Set<ExporterToken>();
+  for (const part of parts) {
+    const token = part.trim().toLowerCase();
+    if (!EXPORTER_TOKENS.has(token)) continue;
+    const typed = token as ExporterToken;
+    if (seen.has(typed)) continue;
+    seen.add(typed);
+    out.push(typed);
+  }
+  return out;
+}
+
+/** Parse comma-separated exporter env values; unknown tokens are dropped. */
+export function parseExporters(raw: string | undefined, fallback: ExporterToken[]): ExporterToken[] {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = dedupeValidExporterParts(raw.split(","));
+  return parsed.length > 0 ? parsed : fallback;
+}
+
+/** Validate exporter token arrays from settings JSON. */
+export function parseExporterTokensFromArray(
+  tokens: string[] | undefined,
+  fallback: ExporterToken[],
+): ExporterToken[] {
+  if (!tokens || tokens.length === 0) return fallback;
+  const parsed = dedupeValidExporterParts(tokens);
+  return parsed.length > 0 ? parsed : fallback;
+}
+
+function normalizeProtocol(v: string | undefined): Protocol {
+  const p = (v ?? "").trim().toLowerCase();
+  if (p === "grpc") return "grpc";
+  if (p === "http/json") return "http/json";
+  // default and explicit "http" / "http/protobuf" -> http/protobuf
+  return "http/protobuf";
+}
+
+function normalizeCapture(v: string | undefined): ContentCapture {
+  const p = (v ?? "").trim().toLowerCase();
+  if (p === "metadata_only") return "metadata_only";
+  if (p === "no_tool_content") return "no_tool_content";
+  if (p === "true" || p === "1" || p === "full") return "full";
+  return "full"; // project requirement: capture everything by default
+}
+
+function normalizeDiag(v: string | undefined): DiagLogLevel {
+  switch ((v ?? "").trim().toLowerCase()) {
+    case "none": return DiagLogLevel.NONE;
+    case "error": return DiagLogLevel.ERROR;
+    case "warn":
+    case "warning": return DiagLogLevel.WARN;
+    case "info": return DiagLogLevel.INFO;
+    case "debug": return DiagLogLevel.DEBUG;
+    case "verbose":
+    case "trace": return DiagLogLevel.VERBOSE;
+    case "all": return DiagLogLevel.ALL;
+    default: return DiagLogLevel.NONE;
+  }
+}
+
+/** Derive a per-signal endpoint from a base. For HTTP, append /v1/<signal>;
+ * for gRPC the base is a bare host:port and is returned unchanged. */
+export function resolveSignalEndpoint(
+  base: string,
+  signal: "traces" | "metrics" | "logs",
+  protocol: Protocol,
+  explicit?: string,
+): string {
+  if (explicit) return explicit;
+  const trimmed = base.replace(/\/+$/, "");
+  if (protocol === "grpc") return trimmed;
+  if (/\/v1\/(traces|metrics|logs)$/.test(trimmed)) return trimmed;
+  return `${trimmed}/v1/${signal}`;
+}
+
+export function resolveConfig(cwd: string): ResolvedConfig {
+  const project = readJson(join(cwd, ".pi", "settings.json"))?.otel ?? {};
+  const global = readJson(join(homedir(), ".pi", "agent", "settings.json"))?.otel ?? {};
+  // Project overrides global.
+  const s: SettingsOtel = { ...global, ...project } as SettingsOtel;
+
+  const baseEndpoint =
+    envStr("OTEL_EXPORTER_OTLP_ENDPOINT") ?? s.endpoint ?? "http://localhost:4318";
+
+  const protocol = normalizeProtocol(
+    envStr(
+      "OTEL_EXPORTER_OTLP_PROTOCOL",
+      // Some setups use per-signal protocol vars; the traces one is a fine hint.
+      "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    ) ?? s.protocol,
+  );
+
+  const headers = {
+    ...(s.headers ?? {}),
+    ...parseKv(process.env.OTEL_EXPORTER_OTLP_HEADERS),
+  };
+
+  // Master enable: PI_OTEL_DISABLED wins, else env enable flag, else settings.
+  const disabled =
+    envStr("PI_OTEL_DISABLED") === "1" ||
+    envStr("PI_OTEL_DISABLED")?.toLowerCase() === "true";
+  const enabled = disabled
+    ? false
+    : envBool(["PI_OTEL_ENABLED"], s.enabled ?? true);
+
+  const sampleRatio = Math.min(
+    1,
+    Math.max(0, envNum(["OTEL_TRACES_SAMPLER_ARG", "PI_OTEL_SAMPLE_RATIO"], s.sampleRatio ?? 1)),
+  );
+
+  return {
+    enabled,
+    endpoint: baseEndpoint,
+    tracesEndpoint: resolveSignalEndpoint(
+      baseEndpoint,
+      "traces",
+      protocol,
+      envStr("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") ?? s.tracesEndpoint,
+    ),
+    metricsEndpoint: resolveSignalEndpoint(
+      baseEndpoint,
+      "metrics",
+      protocol,
+      envStr("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") ?? s.metricsEndpoint,
+    ),
+    logsEndpoint: resolveSignalEndpoint(
+      baseEndpoint,
+      "logs",
+      protocol,
+      envStr("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") ?? s.logsEndpoint,
+    ),
+    protocol,
+    headers,
+    serviceName: envStr("OTEL_SERVICE_NAME", "PI_OTEL_SERVICE_NAME") ?? s.serviceName ?? "pi",
+    resourceAttributes: parseKv(process.env.OTEL_RESOURCE_ATTRIBUTES, true),
+    captureContent: normalizeCapture(envStr("PI_OTEL_CAPTURE_CONTENT") ?? s.captureContent),
+    sampleRatio,
+    metricExportInterval: envNum(["OTEL_METRIC_EXPORT_INTERVAL", "PI_OTEL_METRIC_EXPORT_INTERVAL"], s.metricExportInterval ?? 10000),
+    tracesExporters: parseExporters(
+      process.env.OTEL_TRACES_EXPORTER,
+      parseExporterTokensFromArray(s.tracesExporters, ["otlp"]),
+    ),
+    metricsExporters: parseExporters(
+      process.env.OTEL_METRICS_EXPORTER,
+      parseExporterTokensFromArray(s.metricsExporters, ["otlp"]),
+    ),
+    logsExporters: parseExporters(
+      process.env.OTEL_LOGS_EXPORTER,
+      parseExporterTokensFromArray(s.logsExporters, ["otlp"]),
+    ),
+    tracesExportInterval: envNum(["OTEL_TRACES_EXPORT_INTERVAL"], s.tracesExportInterval ?? 5000),
+    logsExportInterval: envNum(["OTEL_LOGS_EXPORT_INTERVAL"], s.logsExportInterval ?? 5000),
+    traces: { enabled: envBool(["PI_OTEL_TRACES"], s.traces ?? true) },
+    metrics: { enabled: envBool(["PI_OTEL_METRICS"], s.metrics ?? true) },
+    logs: { enabled: envBool(["PI_OTEL_LOGS"], s.logs ?? true) },
+    diagLogLevel: normalizeDiag(envStr("OTEL_LOG_LEVEL", "PI_OTEL_DIAG_LOG_LEVEL") ?? s.diagLogLevel),
+    selfLogs: envBool(["PI_OTEL_SELF_LOGS"], s.selfLogs ?? true),
+    shutdownTimeoutMs: envNum(["PI_OTEL_SHUTDOWN_TIMEOUT_MS"], s.shutdownTimeoutMs ?? 2000),
+    cwd,
+  };
+}

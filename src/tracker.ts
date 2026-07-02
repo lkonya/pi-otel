@@ -1,0 +1,731 @@
+/**
+ * Span lifecycle tracker.
+ *
+ * Owns the span tree:
+ *   pi.interaction (per user prompt)
+ *   └─ pi.turn (per LLM call + tool execution)
+ *      ├─ pi.llm_request  [SpanKind.CLIENT]  (the model call)
+ *      └─ pi.tool.<name>                     (siblings: each tool call)
+ *
+ * `pi.session` is the root, opened on session_start and closed on
+ * session_shutdown. Within it, each user prompt opens an interaction.
+ *
+ * Design notes:
+ *  - Tool spans are siblings of the LLM span under the turn, NOT children.
+ *    Tools execute after the model call returns, so parenting them to the
+ *    LLM span would misrepresent the causal relationship.
+ *  - Every span is closed defensively: on turn_end, on session replacement
+ *    (before_switch/fork/compact/tree), on session_shutdown, and on abort.
+ *    No orphaned spans survive.
+ *  - Cancellation (Esc/abort) is detected via ctx.signal during a turn and
+ *    marks active spans with `pi.cancelled` and ERROR status.
+ *  - All handlers are best-effort: telemetry must never break pi's agent loop.
+ */
+
+import {
+  type Context,
+  SpanKind,
+  SpanStatusCode,
+  type Span,
+  type Tracer,
+  context as otelContext,
+  trace,
+  type Attributes,
+} from "@opentelemetry/api";
+// Message shapes are imported structurally (see MessageShapes below) rather
+// than from @earendil-works/pi-ai, which is a transitive dep of pi-coding-agent
+// and not guaranteed to resolve from an extension's own node_modules.
+import {
+  ATTR_GEN_AI_AGENT_NAME,
+  ATTR_GEN_AI_CACHE_READ_TOKENS,
+  ATTR_GEN_AI_CACHE_WRITE_1H_TOKENS,
+  ATTR_GEN_AI_CACHE_WRITE_TOKENS,
+  ATTR_GEN_AI_COST_USD,
+  ATTR_GEN_AI_INPUT_MESSAGES,
+  ATTR_GEN_AI_INPUT_TOKENS,
+  ATTR_GEN_AI_OPERATION_NAME,
+  ATTR_GEN_AI_OUTPUT_MESSAGES,
+  ATTR_GEN_AI_OUTPUT_TOKENS,
+  ATTR_GEN_AI_REASONING_TOKENS,
+  ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
+  ATTR_GEN_AI_RESPONSE_ID,
+  ATTR_GEN_AI_RESPONSE_MODEL,
+  ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_GEN_AI_SYSTEM,
+  ATTR_GEN_AI_TOKEN_TYPE,
+  ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
+  ATTR_GEN_AI_TOOL_CALL_ID,
+  ATTR_GEN_AI_TOOL_CALL_RESULT,
+  ATTR_GEN_AI_TOOL_NAME,
+  ATTR_HTTP_STATUS_CODE,
+  ATTR_PI_CANCELLED,
+  ATTR_PI_CWD,
+  ATTR_PI_INTERACTION_ID,
+  ATTR_PI_ORPHANED,
+  ATTR_PI_PROMPT_LENGTH,
+  ATTR_PI_SESSION_FILE,
+  ATTR_PI_SESSION_ID,
+  ATTR_PI_SESSION_REASON,
+  ATTR_PI_TOOL_COUNT,
+  ATTR_PI_TOOL_IS_ERROR,
+  ATTR_PI_TURN_COUNT,
+  ATTR_PI_TURN_INDEX,
+  ATTR_PI_USER_PROMPT,
+  clampAttr,
+  EVENT_GEN_AI_ASSISTANT_MESSAGE,
+  EVENT_GEN_AI_CHOICE,
+  EVENT_GEN_AI_TOOL_MESSAGE,
+  EVENT_GEN_AI_USER_MESSAGE,
+  GEN_AI_SYSTEM,
+  SPAN_INTERACTION,
+  SPAN_LLM_REQUEST,
+  SPAN_SESSION,
+  SPAN_TURN,
+  fingerprint,
+  spanToolName,
+  type ContentCapture,
+} from "./attrs.js";
+import type { Metrics } from "./metrics.js";
+
+export interface TrackerOptions {
+  tracer: Tracer;
+  captureContent: ContentCapture;
+  /** Lazy session id so the tracker doesn't need ctx at construction. */
+  sessionId: () => string | undefined;
+  sessionFile: () => string | undefined;
+  cwd: string;
+  metrics: () => Metrics | null;
+  /** Orphan sweep interval in ms. Default 60_000. */
+  orphanSweepIntervalMs?: number;
+  /** Age at which an open span is considered orphaned, in ms. Default 30 * 60 * 1000. */
+  orphanTtlMs?: number;
+  /** Injection point for tests. Defaults to setInterval / clearInterval / Date.now. */
+  now?: () => number;
+  setTimer?: (fn: () => void, ms: number) => () => void;
+}
+
+interface Slot {
+  span: Span;
+  ctx: Context;
+}
+interface TimedSlot extends Slot {
+  startNs: bigint;
+}
+interface ToolSlot extends TimedSlot {
+  name: string;
+  /** Wall-clock ms when the tool span opened (uses injectable `now()` for orphan sweep). */
+  startMs: number;
+}
+
+const OP_NAME_CHAT = "chat";
+
+export type SessionReason = "startup" | "reload" | "new" | "resume" | "fork";
+
+export class SpanTracker {
+  private opts: TrackerOptions;
+  private session: (Slot) | null = null;
+  private interaction: (Slot) | null = null;
+  private turn: (TimedSlot & { index: number }) | null = null;
+  private llm: (TimedSlot & {
+    requestModel?: string;
+    responseModel?: string;
+    toolCallCount?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    httpStatus?: number;
+    attempts: number;
+    inputMessages: Array<Record<string, unknown>>;
+  }) | null = null;
+  private tools = new Map<string, ToolSlot>();
+
+  private interactionCount = 0;
+  private turnCount = 0;
+  private toolCount = 0;
+  private sessionStartMs = 0;
+  private orphanTimer: (() => void) | null = null;
+  private readonly now: () => number;
+  private readonly orphanTtlMs: number;
+  private interactionStartMs = 0;
+
+  constructor(opts: TrackerOptions) {
+    this.opts = opts;
+    this.now = opts.now ?? (() => Date.now());
+    this.orphanTtlMs = opts.orphanTtlMs ?? 30 * 60 * 1000;
+    this.setTimer = opts.setTimer ?? defaultSetTimer;
+  }
+
+  private setTimer: (fn: () => void, ms: number) => () => void;
+
+  // ---------------------------------------------------------------- sessions
+  startSession(reason?: SessionReason): void {
+    if (this.session) this.endSession();
+    this.sessionStartMs = this.now();
+    const attrs = this.commonAttrs();
+    if (reason !== undefined) {
+      attrs[ATTR_PI_SESSION_REASON] = reason;
+    }
+    const span = this.opts.tracer.startSpan(SPAN_SESSION, {
+      attributes: attrs,
+    });
+    this.session = {
+      span,
+      ctx: trace.setSpan(otelContext.active(), span),
+    };
+    this.startOrphanSweep();
+  }
+
+  endSession(): void {
+    // Defensive: close everything still open.
+    this.endInteraction({ reason: "session_end" });
+    if (this.sessionStartMs > 0) {
+      const durSec = (this.now() - this.sessionStartMs) / 1000;
+      try {
+        this.opts.metrics()?.sessionDuration.record(durSec, this.commonAttrs());
+      } catch { /* best-effort */ }
+    }
+    if (this.session) {
+      this.session.span.setAttribute(ATTR_PI_TURN_COUNT, this.turnCount);
+      this.session.span.setAttribute(ATTR_PI_TOOL_COUNT, this.toolCount);
+      this.session.span.end();
+      this.session = null;
+    }
+    this.stopOrphanSweep();
+  }
+
+  /**
+   * Periodically end any span open longer than orphanTtlMs. Belt-and-suspenders
+   * over the defensive closes in endInteraction: catches spans orphaned by
+   * unexpected code paths or a process that skips session_shutdown.
+   */
+  private startOrphanSweep(): void {
+    if (this.orphanTimer) return;
+    const intervalMs = this.opts.orphanSweepIntervalMs ?? 60_000;
+    this.orphanTimer = this.setTimer(() => this.sweepOrphans(), intervalMs);
+  }
+
+  private stopOrphanSweep(): void {
+    if (this.orphanTimer) {
+      this.orphanTimer();
+      this.orphanTimer = null;
+    }
+  }
+
+  private sweepOrphans(): void {
+    const cutoff = this.now() - this.orphanTtlMs;
+    // End any tool span older than the TTL.
+    for (const [id, slot] of this.tools) {
+      const startMs = slot.startMs;
+      if (startMs < cutoff) {
+        slot.span.setAttribute(ATTR_PI_ORPHANED, true);
+        slot.span.end();
+        this.tools.delete(id);
+      }
+    }
+    // LLM span.
+    if (this.llm && Number(this.llm.startNs) / 1e6 < cutoff) {
+      this.llm.span.setAttribute(ATTR_PI_ORPHANED, true);
+      this.llm.span.end();
+      this.llm = null;
+    }
+    // Turn span.
+    if (this.turn && Number(this.turn.startNs) / 1e6 < cutoff) {
+      this.turn.span.setAttribute(ATTR_PI_ORPHANED, true);
+      this.turn.span.end();
+      this.turn = null;
+    }
+    // Interaction span.
+    if (this.interaction && this.interactionStartMs < cutoff) {
+      this.interaction.span.setAttribute(ATTR_PI_ORPHANED, true);
+      this.interaction.span.end();
+      this.interaction = null;
+      this.interactionStartMs = 0;
+    }
+  }
+
+  // ----------------------------------------------------------- interactions
+  /** A user prompt begins an interaction. */
+  startInteraction(prompt: string | undefined): void {
+    if (this.interaction) this.endInteraction({ reason: "superseded" });
+    this.interactionCount++;
+    this.turnCount = 0;
+    this.toolCount = 0;
+    const attrs = this.commonAttrs();
+    attrs[ATTR_PI_INTERACTION_ID] = this.interactionCount;
+    if (typeof prompt === "string") {
+      attrs[ATTR_PI_PROMPT_LENGTH] = prompt.length;
+      if (shouldCapturePrompt()) {
+        attrs[ATTR_PI_USER_PROMPT] = clampAttr(prompt);
+      } else {
+        Object.assign(attrs, prefixKeys("pi.user_prompt", fingerprint(prompt)));
+      }
+    }
+    const parent = this.session?.ctx ?? otelContext.active();
+    const span = this.opts.tracer.startSpan(SPAN_INTERACTION, { attributes: attrs }, parent);
+    this.interaction = { span, ctx: trace.setSpan(parent, span) };
+    this.interactionStartMs = this.now();
+    try { this.opts.metrics()?.promptCount.add(1, this.commonAttrs()); } catch { /* noop */ }
+  }
+
+  endInteraction(opts: { reason: string; cancelled?: boolean; error?: unknown } = { reason: "end" }): void {
+    // Close any in-flight LLM/tool/turn first.
+    this.endLlm({ reason: opts.reason, cancelled: opts.cancelled, error: opts.error });
+    this.endAllTools(opts.reason);
+    this.endTurn({ reason: opts.reason, cancelled: opts.cancelled, error: opts.error });
+    if (this.interaction) {
+      const span = this.interaction.span;
+      if (opts.cancelled) {
+        span.setAttribute(ATTR_PI_CANCELLED, true);
+      } else if (opts.reason !== "end") {
+        // Any non-normal end (superseded, session_switch/fork/tree, session_end)
+        // means the interaction was abandoned mid-flight.
+        span.setAttribute(ATTR_PI_ORPHANED, true);
+      }
+      span.setAttribute(ATTR_PI_TURN_COUNT, this.turnCount);
+      span.setAttribute(ATTR_PI_TOOL_COUNT, this.toolCount);
+      this.setStatusFromError(span, opts.error);
+      span.end();
+      this.interaction = null;
+      this.interactionStartMs = 0;
+    }
+  }
+
+  // ------------------------------------------------------------------ turns
+  startTurn(turnIndex: number): void {
+    if (!this.interaction) return;
+    if (this.turn) this.endTurn({ reason: "superseded" });
+    this.turnCount++;
+    const attrs = this.commonAttrs();
+    attrs[ATTR_PI_TURN_INDEX] = turnIndex;
+    attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
+    const span = this.opts.tracer.startSpan(SPAN_TURN, { attributes: attrs }, this.interaction.ctx);
+    this.turn = { span, ctx: trace.setSpan(this.interaction.ctx, span), index: turnIndex, startNs: process.hrtime.bigint() };
+    try { this.opts.metrics()?.turnCount.add(1, this.commonAttrs()); } catch { /* noop */ }
+  }
+
+  endTurn(opts: { reason: string; cancelled?: boolean; error?: unknown } = { reason: "end" }): void {
+    if (!this.turn) return;
+    const span = this.turn.span;
+    if (opts.cancelled) span.setAttribute(ATTR_PI_CANCELLED, true);
+    else if (opts.reason === "superseded") span.setAttribute(ATTR_PI_ORPHANED, true);
+    this.setStatusFromError(span, opts.error);
+    span.end();
+    this.turn = null;
+    if (opts.cancelled) {
+      try { this.opts.metrics()?.turnCancellations.add(1, this.commonAttrs()); } catch { /* noop */ }
+    }
+  }
+
+  // ------------------------------------------------------------- llm spans
+  startLlm(requestModel: string | undefined, providerSystem: string | undefined): void {
+    if (this.llm) this.endLlm({ reason: "superseded" });
+    const parent = this.turn?.ctx ?? this.interaction?.ctx ?? otelContext.active();
+    const attrs = this.commonAttrs();
+    attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
+    if (providerSystem) attrs[ATTR_GEN_AI_AGENT_NAME] = providerSystem;
+    if (requestModel) attrs[ATTR_GEN_AI_REQUEST_MODEL] = requestModel;
+    const span = this.opts.tracer.startSpan(
+      SPAN_LLM_REQUEST,
+      { kind: SpanKind.CLIENT, attributes: attrs },
+      parent,
+    );
+    this.llm = {
+      span,
+      ctx: trace.setSpan(parent, span),
+      startNs: process.hrtime.bigint(),
+      requestModel,
+      attempts: 0,
+      inputMessages: [],
+    };
+  }
+
+  /** Buffer an input message (user or tool result) to flush when the LLM span opens. */
+  private pendingInput: Array<{ role: "user" | "tool"; text: string; toolCallId?: string; toolName?: string }> = [];
+
+  noteUserInput(text: string): void {
+    this.pendingInput.push({ role: "user", text });
+    this.flushPendingInput();
+  }
+
+  noteToolResultInput(toolCallId: string, toolName: string | undefined, text: string): void {
+    this.pendingInput.push({ role: "tool", text, toolCallId, toolName });
+    this.flushPendingInput();
+  }
+
+  private flushPendingInput(): void {
+    if (!this.llm || this.pendingInput.length === 0) return;
+    for (const m of this.pendingInput) {
+      if (m.role === "user") {
+        const attrs: Record<string, unknown> = { role: "user", [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM };
+        if (shouldCapturePrompt()) attrs.content = clampAttr(m.text);
+        this.llm.span.addEvent(EVENT_GEN_AI_USER_MESSAGE, attrs as Attributes);
+        this.llm.inputMessages.push({ role: "user", parts: [{ type: "text", content: m.text }] });
+      } else if (shouldCaptureToolContent()) {
+        const attrs: Record<string, unknown> = {
+          role: "tool",
+          [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM,
+          [ATTR_GEN_AI_TOOL_CALL_ID]: m.toolCallId ?? "",
+          ...(m.toolName ? { [ATTR_GEN_AI_TOOL_NAME]: m.toolName } : {}),
+          content: clampAttr(m.text),
+        };
+        this.llm.span.addEvent(EVENT_GEN_AI_TOOL_MESSAGE, attrs as Attributes);
+        this.llm.inputMessages.push({
+          role: "tool",
+          parts: [{ type: "tool_call_response", id: m.toolCallId, name: m.toolName, response: m.text }],
+        });
+      }
+    }
+    this.pendingInput = [];
+  }
+
+  /** Record HTTP response details on the active LLM span; return true if retry detected. */
+  recordProviderResponse(status: number, headers: Record<string, string>): boolean {
+    if (!this.llm) return false;
+    this.llm.attempts++;
+    this.llm.httpStatus = status;
+    this.llm.span.setAttribute(ATTR_HTTP_STATUS_CODE, status);
+    const respId = headers["x-request-id"] ?? headers["request-id"] ?? headers["anthropic-request-id"] ?? headers["openai-response-id"];
+    if (respId) this.llm.span.setAttribute(ATTR_GEN_AI_RESPONSE_ID, respId);
+    const retry = this.llm.attempts > 1;
+    if (retry) {
+      try {
+        const attrs: Attributes = this.commonAttrs();
+        if (this.llm.requestModel) attrs[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+        attrs[ATTR_HTTP_STATUS_CODE] = status;
+        this.opts.metrics()?.providerRetries.add(1, attrs);
+      } catch { /* noop */ }
+    }
+    if (status >= 400) {
+      this.llm.span.setAttribute("error.type", `http_${status}`);
+      this.llm.span.setStatus({ code: SpanStatusCode.ERROR, message: `HTTP ${status}` });
+    }
+    return retry;
+  }
+
+  /** Finalize the LLM span from the completed AssistantMessage. */
+  completeLlm(message: MessageShapes.AssistantMessage): void {
+    if (!this.llm) return;
+    const llm = this.llm;
+    if (message.responseModel) {
+      llm.responseModel = message.responseModel;
+      llm.span.setAttribute(ATTR_GEN_AI_RESPONSE_MODEL, message.responseModel);
+    }
+    if (message.responseId) llm.span.setAttribute(ATTR_GEN_AI_RESPONSE_ID, message.responseId);
+    const finish = message.stopReason;
+    if (finish) llm.span.setAttribute(ATTR_GEN_AI_RESPONSE_FINISH_REASONS, [finish]);
+    this.applyUsageAttrs(message);
+    this.emitAssistantMessageEvents(message);
+    llm.toolCallCount = countToolCalls(message);
+    this.recordLlmMetrics();
+    if (finish === "error" || finish === "aborted") {
+      llm.span.setAttribute(ATTR_PI_CANCELLED, finish === "aborted");
+      if (message.errorMessage) {
+        llm.span.setAttribute("exception.message", message.errorMessage);
+      }
+      llm.span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: message.errorMessage ?? finish,
+      });
+    }
+    llm.span.end();
+    this.llm = null;
+  }
+
+  endLlm(opts: { reason: string; cancelled?: boolean; error?: unknown } = { reason: "end" }): void {
+    if (!this.llm) return;
+    const llm = this.llm;
+    if (opts.cancelled) llm.span.setAttribute(ATTR_PI_CANCELLED, true);
+    else if (opts.reason !== "end") llm.span.setAttribute(ATTR_PI_ORPHANED, true);
+    this.setStatusFromError(llm.span, opts.error);
+    llm.span.end();
+    this.llm = null;
+  }
+
+  private applyUsageAttrs(m: MessageShapes.AssistantMessage): void {
+    if (!this.llm) return;
+    const u = m.usage;
+    if (!u) return;
+    const set = (k: string, v: unknown) => {
+      if (typeof v === "number" && Number.isFinite(v)) this.llm!.span.setAttribute(k, v);
+    };
+    set(ATTR_GEN_AI_INPUT_TOKENS, u.input);
+    set(ATTR_GEN_AI_OUTPUT_TOKENS, u.output);
+    set(ATTR_GEN_AI_CACHE_READ_TOKENS, u.cacheRead);
+    set(ATTR_GEN_AI_CACHE_WRITE_TOKENS, u.cacheWrite);
+    if (typeof u.cacheWrite1h === "number") {
+      set(ATTR_GEN_AI_CACHE_WRITE_1H_TOKENS, u.cacheWrite1h);
+    }
+    if (typeof u.cost?.total === "number") {
+      set(ATTR_GEN_AI_COST_USD, u.cost.total);
+    }
+    this.llm.inputTokens = u.input;
+    this.llm.outputTokens = u.output;
+  }
+
+  private recordLlmMetrics(): void {
+    if (!this.llm) return;
+    const m = this.opts.metrics();
+    if (!m) return;
+    const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
+    const base: Attributes = this.commonAttrs();
+    if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    if (this.llm.responseModel) base[ATTR_GEN_AI_RESPONSE_MODEL] = this.llm.responseModel;
+    try {
+      m.opDuration.record(elapsedSec, base);
+      if (typeof this.llm.inputTokens === "number") {
+        m.tokenUsage.record(this.llm.inputTokens, { ...base, [ATTR_GEN_AI_TOKEN_TYPE]: "input" });
+      }
+      if (typeof this.llm.outputTokens === "number") {
+        m.tokenUsage.record(this.llm.outputTokens, { ...base, [ATTR_GEN_AI_TOKEN_TYPE]: "output" });
+      }
+    } catch { /* best-effort */ }
+  }
+
+  private emitAssistantMessageEvents(m: MessageShapes.AssistantMessage): void {
+    if (!this.llm) return;
+    const text = extractAssistantText(m);
+    const toolCalls = extractToolCalls(m);
+    if (shouldCapturePrompt()) {
+      const asstAttrs: Record<string, unknown> = { role: "assistant", [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM };
+      if (text) asstAttrs.content = clampAttr(text);
+      if (toolCalls.length) asstAttrs["tool_calls"] = clampAttr(toolCalls);
+      this.llm.span.addEvent(EVENT_GEN_AI_ASSISTANT_MESSAGE, asstAttrs as Attributes);
+      const finish = m.stopReason ?? "stop";
+      this.llm.span.addEvent(EVENT_GEN_AI_CHOICE, {
+        [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM,
+        index: 0,
+        finish_reason: finish,
+        message: clampAttr({ role: "assistant", content: text, tool_calls: toolCalls.length ? toolCalls : undefined }),
+      });
+      // Aspire-style JSON message attributes (read by 9.x AI panel and others).
+      if (this.llm.inputMessages.length > 0) {
+        this.llm.span.setAttribute(ATTR_GEN_AI_INPUT_MESSAGES, clampAttr(this.llm.inputMessages));
+      }
+      const outputParts: Array<Record<string, unknown>> = [];
+      if (text) outputParts.push({ type: "text", content: text });
+      for (const tc of toolCalls) {
+        outputParts.push({ type: "tool_call", id: tc.id, name: tc.function.name, arguments: tc.function.arguments });
+      }
+      this.llm.span.setAttribute(
+        ATTR_GEN_AI_OUTPUT_MESSAGES,
+        clampAttr([{ role: "assistant", parts: outputParts, finish_reason: m.stopReason ?? "stop" }]),
+      );
+    }
+  }
+
+  // ------------------------------------------------------------------ tools
+  startTool(toolCallId: string, toolName: string, input: unknown): void {
+    const parent = this.turn?.ctx ?? this.interaction?.ctx ?? otelContext.active();
+    const attrs = this.commonAttrs();
+    attrs[ATTR_GEN_AI_TOOL_NAME] = toolName;
+    attrs[ATTR_GEN_AI_TOOL_CALL_ID] = toolCallId;
+    if (shouldCaptureToolContent() && input !== undefined) {
+      attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] = clampAttr(input);
+    }
+    const span = this.opts.tracer.startSpan(spanToolName(toolName), { attributes: attrs }, parent);
+    this.tools.set(toolCallId, {
+      span,
+      ctx: trace.setSpan(parent, span),
+      name: toolName,
+      startNs: process.hrtime.bigint(),
+      startMs: this.now(),
+    });
+    this.toolCount++;
+  }
+
+  endTool(toolCallId: string, isError: boolean, result: unknown): void {
+    const slot = this.tools.get(toolCallId);
+    if (!slot) return;
+    this.tools.delete(toolCallId);
+    slot.span.setAttribute(ATTR_PI_TOOL_IS_ERROR, isError);
+    if (shouldCaptureToolContent() && result !== undefined) {
+      slot.span.setAttribute(ATTR_GEN_AI_TOOL_CALL_RESULT, clampAttr(result));
+    }
+    const elapsedMs = Number(process.hrtime.bigint() - slot.startNs) / 1e6;
+    slot.span.setAttribute("pi.tool.duration_ms", elapsedMs);
+    if (isError) {
+      slot.span.setAttribute("error.type", "tool_error");
+      slot.span.setStatus({ code: SpanStatusCode.ERROR, message: "tool execution failed" });
+    }
+    slot.span.end();
+    try {
+      const attrs: Attributes = this.commonAttrs();
+      attrs[ATTR_GEN_AI_TOOL_NAME] = slot.name;
+      if (isError) attrs["error.type"] = "tool_error";
+      this.opts.metrics()?.toolCalls.add(1, attrs);
+    } catch { /* noop */ }
+  }
+
+  private endAllTools(reason: string): void {
+    const markOrphaned = reason !== "end" && reason !== "session_end";
+    for (const [, slot] of this.tools) {
+      if (markOrphaned) slot.span.setAttribute(ATTR_PI_ORPHANED, true);
+      slot.span.end();
+    }
+    this.tools.clear();
+  }
+
+  // --------------------------------------------------------------- helpers
+  private commonAttrs(): Attributes {
+    const attrs: Attributes = {
+      [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM,
+      [ATTR_PI_CWD]: this.opts.cwd,
+    };
+    const sid = this.opts.sessionId();
+    if (sid) attrs[ATTR_PI_SESSION_ID] = sid;
+    const file = this.opts.sessionFile();
+    if (file) attrs[ATTR_PI_SESSION_FILE] = file;
+    return attrs;
+  }
+
+  private setStatusFromError(span: Span, error: unknown): void {
+    if (!error) return;
+    const errName = error instanceof Error ? error.name : "Error";
+    const errMsg = error instanceof Error ? error.message : String(error);
+    span.setAttribute("error.type", errName);
+    span.setAttribute("exception.message", errMsg);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
+  }
+
+  /** Mark all active spans as cancelled (Esc/abort). */
+  markCancelled(): void {
+    if (this.llm) this.llm.span.setAttribute(ATTR_PI_CANCELLED, true);
+    for (const [, slot] of this.tools) slot.span.setAttribute(ATTR_PI_CANCELLED, true);
+    if (this.turn) this.turn.span.setAttribute(ATTR_PI_CANCELLED, true);
+    if (this.interaction) this.interaction.span.setAttribute(ATTR_PI_CANCELLED, true);
+  }
+
+  /** Surface the active interaction's trace id (e.g. for UI display). */
+  activeTraceId(): string | undefined {
+    return (this.session ?? this.interaction)?.span.spanContext().traceId;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Module-private content-capture gates
+// ---------------------------------------------------------------------------
+
+function shouldCapturePrompt(): boolean {
+  // Resolved at runtime via the tracker's options; mirror that logic here.
+  // Captured via closure below to avoid passing captureContent around.
+  return CAPTURE_PROMPTS;
+}
+function shouldCaptureToolContent(): boolean {
+  return CAPTURE_TOOL;
+}
+let CAPTURE_PROMPTS = true;
+let CAPTURE_TOOL = true;
+export function configureCapture(c: ContentCapture): void {
+  CAPTURE_PROMPTS = c === "no_tool_content" || c === "full";
+  CAPTURE_TOOL = c === "full";
+}
+
+// ---------------------------------------------------------------------------
+// Message-shape helpers (typed against @earendil-works/pi-ai)
+// ---------------------------------------------------------------------------
+
+function extractAssistantText(m: MessageShapes.AssistantMessage): string {
+  const parts: string[] = [];
+  for (const p of m.content) {
+    if (p.type === "text") parts.push(p.text);
+  }
+  return parts.join("\n");
+}
+
+function extractToolCalls(m: MessageShapes.AssistantMessage): Array<{
+  id: string;
+  type: "function";
+  function: { name: string; arguments?: string };
+}> {
+  const out: Array<{ id: string; type: "function"; function: { name: string; arguments?: string } }> = [];
+  for (const p of m.content) {
+    if (p.type !== "toolCall") continue;
+    const tc = p;
+    const fn: { name: string; arguments?: string } = { name: tc.name };
+    if (shouldCaptureToolContent()) {
+      fn.arguments = typeof tc.arguments === "string" ? tc.arguments : clampAttr(tc.arguments);
+    }
+    out.push({ id: tc.id, type: "function", function: fn });
+  }
+  return out;
+}
+
+function countToolCalls(m: MessageShapes.AssistantMessage): number {
+  let n = 0;
+  for (const p of m.content) if (p.type === "toolCall") n++;
+  return n;
+}
+
+/** Flatten any message's content to text. */
+export function extractMessageText(message: { content?: unknown }): string {
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const p of content as Array<{ type?: string; text?: string }>) {
+    if (p?.type === "text" && typeof p.text === "string") parts.push(p.text);
+  }
+  return parts.join("\n");
+}
+
+function prefixKeys(prefix: string, obj: Record<string, number | string>): Record<string, number | string> {
+  const out: Record<string, number | string> = {};
+  for (const [k, v] of Object.entries(obj)) out[`${prefix}.${k}`] = v;
+  return out;
+}
+
+export type { MessageShapes };
+
+// ---------------------------------------------------------------------------
+// Structural message shapes.
+// These mirror @earendil-works/pi-ai's AssistantMessage / ToolCall / Usage.
+// We declare them locally rather than importing from pi-ai (a transitive dep
+// of pi-coding-agent that may not resolve from an extension's node_modules).
+// Keeping them structural also lets us tolerate minor field additions across
+// pi versions without a type error.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Structural message shapes.
+// These mirror @earendil-works/pi-ai's AssistantMessage / ToolCall / Usage.
+// We declare them locally rather than importing from pi-ai (a transitive dep
+// of pi-coding-agent that may not resolve from an extension's node_modules).
+// Keeping them structural also lets us tolerate minor field additions across
+// pi versions without a type error.
+// ---------------------------------------------------------------------------
+namespace MessageShapes {
+  export interface Usage {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cacheWrite1h?: number;
+    totalTokens?: number;
+    cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+  }
+  export type StopReason = string; // "stop" | "end_turn" | "max_tokens" | "tool_use" | "error" | "aborted" | ...
+  export interface TextPart { type: "text"; text: string }
+  export interface ToolCallPart {
+    type: "toolCall";
+    id: string;
+    name: string;
+    arguments: Record<string, unknown> | string;
+  }
+  export interface AssistantMessage {
+    role: "assistant";
+    // `content` is a discriminated union on `type`. The last member is a
+    // catch-all for parts we don't model (thinking, redacted_thought, ...).
+    content: Array<TextPart | ToolCallPart | { type: "thinking" } | { type: "other" }>;
+    model: string;
+    responseModel?: string;
+    responseId?: string;
+    usage: Usage;
+    stopReason: StopReason;
+    errorMessage?: string;
+  }
+}
+
+/** Default timer: setInterval with unref so the sweep never blocks process exit. */
+function defaultSetTimer(fn: () => void, ms: number): () => void {
+  const h = setInterval(fn, ms);
+  h.unref?.();
+  return () => clearInterval(h);
+}
