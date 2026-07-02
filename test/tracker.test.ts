@@ -22,6 +22,7 @@ import {
   ATTR_HTTP_STATUS_CODE,
   ATTR_PI_SESSION_ID,
   ATTR_PI_SESSION_REASON,
+  ATTR_PI_SESSION_PARENT_ID,
   ATTR_PI_TURN_INDEX,
   ATTR_PI_TOOL_IS_ERROR,
   ATTR_PI_CANCELLED,
@@ -167,6 +168,21 @@ describe("session start reason", () => {
     await h.flush();
     const attrs = h.spansByName()[SPAN_SESSION].attributes;
     assert.equal(ATTR_PI_SESSION_REASON in attrs, false);
+  });
+
+  test("startSession(fork, parent-abc) sets pi.session.parent_id on session span", async () => {
+    h.tracker.startSession("fork", "parent-abc");
+    h.tracker.endSession();
+    await h.flush();
+    assert.equal(h.spansByName()[SPAN_SESSION].attributes[ATTR_PI_SESSION_PARENT_ID], "parent-abc");
+  });
+
+  test("startSession() with no parentId omits pi.session.parent_id", async () => {
+    h.tracker.startSession();
+    h.tracker.endSession();
+    await h.flush();
+    const attrs = h.spansByName()[SPAN_SESSION].attributes;
+    assert.equal(ATTR_PI_SESSION_PARENT_ID in attrs, false);
   });
 });
 
@@ -670,6 +686,70 @@ describe("session summary attributes", () => {
     assert.equal(ATTR_GEN_AI_OUTPUT_TOKENS in a, false);
     assert.equal(ATTR_GEN_AI_COST_USD in a, false);
     assert.equal(ATTR_PI_ERROR_COUNT in a, false);
+  });
+});
+
+describe("time to completion", () => {
+  function metricsWithCompletion(r: RecordingMetrics) {
+    const m = recordingMetricsOf(r);
+    (m as { timeToCompletion: ReturnType<RecordingMetrics["histogram"]> }).timeToCompletion = r.histogram("completion");
+    return m;
+  }
+
+  test("noteLlmComplete records completion event and histogram once", async () => {
+    const spanExporter = h.spanExporter;
+    const rec = h.metrics;
+    const tracker = new SpanTracker({
+      tracer: h.tracer,
+      captureContent: "full",
+      sessionId: () => "test-session",
+      sessionFile: () => "/tmp/test.jsonl",
+      cwd: "/test",
+      metrics: () => metricsWithCompletion(rec),
+    });
+    tracker.startSession();
+    tracker.startInteraction("p");
+    tracker.startTurn(0);
+    tracker.startLlm("claude-4", "anthropic");
+    tracker.noteLlmComplete({ role: "assistant" });
+    tracker.noteLlmComplete({ role: "assistant" });
+    tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    tracker.endTurn();
+    tracker.endInteraction();
+    tracker.endSession();
+    await h.flush();
+    const llm = spanExporter.getFinishedSpans().find(s => s.name === SPAN_LLM_REQUEST);
+    assert.ok(llm);
+    const completionEvents = llm!.events.filter(e => e.name === "gen_ai.completion");
+    assert.equal(completionEvents.length, 1);
+    assert.ok(rec.histograms["completion"]?.length === 1);
+  });
+
+  test("noteLlmComplete with user role is a no-op", async () => {
+    const spanExporter = h.spanExporter;
+    const rec = h.metrics;
+    const tracker = new SpanTracker({
+      tracer: h.tracer,
+      captureContent: "full",
+      sessionId: () => "test-session",
+      sessionFile: () => "/tmp/test.jsonl",
+      cwd: "/test",
+      metrics: () => metricsWithCompletion(rec),
+    });
+    tracker.startSession();
+    tracker.startInteraction("p");
+    tracker.startTurn(0);
+    tracker.startLlm("claude-4", "anthropic");
+    tracker.noteLlmComplete({ role: "user" });
+    tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    tracker.endTurn();
+    tracker.endInteraction();
+    tracker.endSession();
+    await h.flush();
+    const llm = spanExporter.getFinishedSpans().find(s => s.name === SPAN_LLM_REQUEST);
+    assert.ok(llm);
+    assert.equal(llm!.events.filter(e => e.name === "gen_ai.completion").length, 0);
+    assert.equal(rec.histograms["completion"]?.length ?? 0, 0);
   });
 });
 

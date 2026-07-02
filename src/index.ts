@@ -83,7 +83,7 @@ export default function (pi: ExtensionAPI): void {
     return f ? basename(f, ".jsonl") : undefined;
   };
 
-  const start = async (ctx: ExtensionContext, reason?: SessionReason): Promise<void> => {
+  const start = async (ctx: ExtensionContext, reason?: SessionReason, parentId?: string): Promise<void> => {
     if (runtime) return; // idempotent
     // Re-resolve config with the session's cwd so project settings win.
     cfg = resolveConfig(ctx.cwd);
@@ -100,7 +100,7 @@ export default function (pi: ExtensionAPI): void {
       cwd: ctx.cwd,
       metrics: () => getMetrics(runtime?.meterProvider),
     });
-    tracker.startSession(reason);
+    tracker.startSession(reason, parentId);
   };
 
   const stop = async (reason: string): Promise<void> => {
@@ -125,7 +125,10 @@ export default function (pi: ExtensionAPI): void {
   // ----------------------------------------------------------------- events
   pi.on("session_start", async (event, ctx) => {
     lastCtx = ctx;
-    await start(ctx, event.reason);
+    const parentId = event.previousSessionFile
+      ? basename(event.previousSessionFile, ".jsonl")
+      : undefined;
+    await start(ctx, event.reason, parentId);
     if (cfg.selfLogs && runtime) {
       emitLog(
         runtime.loggerProvider,
@@ -221,6 +224,10 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("message_update", async (event, _ctx) => {
     tracker?.noteFirstToken(event.message);
+  });
+
+  pi.on("message_end", async (event, _ctx) => {
+    tracker?.noteLlmComplete(event.message);
   });
 
   // Capture input messages for the gen_ai.input.messages attribute.

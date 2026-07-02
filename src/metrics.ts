@@ -17,6 +17,8 @@ export interface Metrics {
   opDuration: Histogram;
   /** gen_ai.client.time_to_first_token (s) — request start to first streamed token. */
   timeToFirstToken: Histogram;
+  /** gen_ai.client.time_to_completion (s) — request start to final assistant token. */
+  timeToCompletion: Histogram;
   /** gen_ai.client.token.usage ({token}) — tokens per LLM request, by token type. */
   tokenUsage: Histogram;
   /** gen_ai.client.tool.calls ({call}) — tool invocations. */
@@ -50,6 +52,10 @@ export function getMetrics(provider: MeterProvider | null | undefined): Metrics 
     }),
     timeToFirstToken: meter.createHistogram("gen_ai.client.time_to_first_token", {
       description: "Time from LLM request start to first streamed token",
+      unit: "s",
+    }),
+    timeToCompletion: meter.createHistogram("gen_ai.client.time_to_completion", {
+      description: "Duration of GenAI client operations from request start to completion",
       unit: "s",
     }),
     tokenUsage: meter.createHistogram("gen_ai.client.token.usage", {

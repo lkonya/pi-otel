@@ -56,6 +56,7 @@ export const EVENT_GEN_AI_TOOL_MESSAGE = "gen_ai.tool.message";
 export const EVENT_GEN_AI_ASSISTANT_MESSAGE = "gen_ai.assistant.message";
 export const EVENT_GEN_AI_CHOICE = "gen_ai.choice";
 export const EVENT_GEN_AI_FIRST_TOKEN = "gen_ai.first_token";
+export const EVENT_GEN_AI_COMPLETION = "gen_ai.completion";
 
 // ---------------------------------------------------------------------------
 // error / http
@@ -75,6 +76,8 @@ export const ATTR_PI_SESSION_ID = "pi.session.id";
 export const ATTR_PI_SESSION_FILE = "pi.session.file";
 /** Why the pi session started. Values: startup | reload | new | resume | fork. Mirrors pi's SessionStartEvent.reason. */
 export const ATTR_PI_SESSION_REASON = "pi.session.reason";
+/** Filename stem of the parent session, for new/resume/fork starts. Omitted on startup/reload. */
+export const ATTR_PI_SESSION_PARENT_ID = "pi.session.parent_id";
 export const ATTR_PI_CWD = "pi.cwd";
 export const ATTR_PI_TURN_INDEX = "pi.turn.index";
 export const ATTR_PI_TURN_COUNT = "pi.turn_count";

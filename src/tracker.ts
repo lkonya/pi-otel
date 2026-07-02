@@ -68,6 +68,7 @@ import {
   ATTR_PI_PROMPT_LENGTH,
   ATTR_PI_SESSION_FILE,
   ATTR_PI_SESSION_ID,
+  ATTR_PI_SESSION_PARENT_ID,
   ATTR_PI_SESSION_REASON,
   ATTR_PI_TOOL_COUNT,
   ATTR_PI_TOOL_IS_ERROR,
@@ -77,6 +78,7 @@ import {
   clampAttr,
   EVENT_GEN_AI_ASSISTANT_MESSAGE,
   EVENT_GEN_AI_CHOICE,
+  EVENT_GEN_AI_COMPLETION,
   EVENT_GEN_AI_FIRST_TOKEN,
   EVENT_GEN_AI_TOOL_MESSAGE,
   EVENT_GEN_AI_USER_MESSAGE,
@@ -160,6 +162,7 @@ export class SpanTracker {
     attempts: number;
     inputMessages: Array<Record<string, unknown>>;
     firstTokenSeen?: boolean;
+    completionRecorded?: boolean;
   }) | null = null;
   private tools = new Map<string, ToolSlot>();
 
@@ -186,12 +189,15 @@ export class SpanTracker {
   private setTimer: (fn: () => void, ms: number) => () => void;
 
   // ---------------------------------------------------------------- sessions
-  startSession(reason?: SessionReason): void {
+  startSession(reason?: SessionReason, parentId?: string): void {
     if (this.session) this.endSession();
     this.sessionStartMs = this.now();
     const attrs = this.commonAttrs();
     if (reason !== undefined) {
       attrs[ATTR_PI_SESSION_REASON] = reason;
+    }
+    if (parentId) {
+      attrs[ATTR_PI_SESSION_PARENT_ID] = parentId;
     }
     const span = this.opts.tracer.startSpan(SPAN_SESSION, {
       attributes: attrs,
@@ -393,6 +399,18 @@ export class SpanTracker {
       this.opts.metrics()?.timeToFirstToken.record(elapsedSec, base);
     } catch { /* best-effort */ }
     this.llm.span.addEvent(EVENT_GEN_AI_FIRST_TOKEN, { elapsed_s: elapsedSec } as Attributes);
+  }
+
+  noteLlmComplete(message: { role?: string }): void {
+    if (!this.llm || message.role !== "assistant" || this.llm.completionRecorded) return;
+    this.llm.completionRecorded = true;
+    const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
+    const base: Attributes = this.commonAttrs();
+    if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    try {
+      this.opts.metrics()?.timeToCompletion.record(elapsedSec, base);
+    } catch { /* best-effort */ }
+    this.llm.span.addEvent(EVENT_GEN_AI_COMPLETION, { elapsed_s: elapsedSec } as Attributes);
   }
 
   noteSystemPrompt(prompt: string): void {
