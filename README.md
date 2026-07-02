@@ -26,6 +26,7 @@ Tool spans sit as siblings of the LLM span under the turn. Tools run after the m
 
 - `gen_ai.client.operation.duration` (histogram, seconds)
 - `gen_ai.client.time_to_first_token` (histogram, seconds; gap between request start and the first streamed assistant token)
+- `gen_ai.client.time_to_completion` (histogram, seconds; gap between request start and the last streamed assistant token, sourced from the `message_end` event)
 - `gen_ai.client.token.usage` (histogram, by `gen_ai.token.type`: input, output, cache_read, cache_write, cache_write_1h, reasoning)
 - `gen_ai.client.tool.calls` (counter)
 
@@ -51,6 +52,8 @@ Token usage uses a histogram. The semconv is explicit about this. Histograms let
 
 **Tags session origin.** Every session span carries `pi.session.reason` with the value pi reported for the start: `startup`, `reload`, `new`, `resume`, or `fork`. Filter to forks to see branched sessions apart from primary ones.
 
+**Links sessions to their parent.** On `new`, `resume`, and `fork` starts the session span also carries `pi.session.parent_id` (the parent session's filename stem, matching `pi.session.id`). A backend that renders parent links reconstructs the full fork and resume tree for a working session, so you can trace where a branched conversation came from.
+
 **Shuts down on a deadline.** `forceFlush` and `shutdown` race `PI_OTEL_SHUTDOWN_TIMEOUT_MS` (default 2000ms). A dead collector records the failure on `health.lastShutdownError` and pi still exits. A 60s unref'd sweep ends spans open longer than 30 minutes as `pi.orphaned`, including paths that skip `session_shutdown`. SIGTERM and SIGHUP run best-effort shutdown for container stops and closed terminals. The extension does not hook `exit` or `beforeExit`.
 
 **Flags provider retries, HTTP errors, and cancellations.** The tracker watches every provider response. HTTP errors land on the LLM span as a categorized `error.type`: `rate_limit`, `server_error`, `auth_error`, `timeout`, `request_too_large`, or `client_error`. Thrown errors map to the same set plus `content_filter`. Retries within a single request bump `pi.provider.retries`, and an aborted turn marks its spans `pi.cancelled` and bumps `pi.turn.cancellations`. Spot rate-limit storms and stuck turns without reading logs.
@@ -59,7 +62,7 @@ Token usage uses a histogram. The semconv is explicit about this. Histograms let
 
 **Picks an exporter per signal.** `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, and `OTEL_LOGS_EXPORTER` accept comma-separated `otlp` (default), `console`, and `none`. Unknown tokens drop. `none` alone disables that signal. `otlp,console` mirrors to stdout for debugging in print and rpc modes. Console strips out when pi runs in TUI mode so JSON does not corrupt the display.
 
-**Tracks Pi's full lifecycle.** Spans for sessions, prompts, turns, LLM requests, and tool calls. Each session span ends with a summary: total input and output tokens, total cost, and an error count, so one row shows the whole session's spend at a glance. Each interaction carries a one-way hash of the assembled system prompt (`gen_ai.system.prompt.hash`) so backends can group sessions by prompt template and A/B iterations without the prompt text leaving the machine. Log records for session start and end, compaction, model changes, user bash commands, and tool and LLM errors. Metrics for operation duration, time to first token, token usage, tool calls, session duration, prompts, turns, provider retries, cancellations, and compactions.
+**Tracks Pi's full lifecycle.** Spans for sessions, prompts, turns, LLM requests, and tool calls. Each session span ends with a summary: total input and output tokens, total cost, and an error count, so one row shows the whole session's spend at a glance. Each interaction carries a one-way hash of the assembled system prompt (`gen_ai.system.prompt.hash`) so backends can group sessions by prompt template and A/B iterations without the prompt text leaving the machine. Log records for session start and end, compaction, model changes, user bash commands, and tool and LLM errors. Metrics for operation duration, time to first token, time to completion, token usage, tool calls, session duration, prompts, turns, provider retries, cancellations, and compactions.
 
 **Dial content capture per project.** `captureContent` defaults to `full` and ships prompts, completions, and tool input and output to your backend, clamped to 64 KiB per attribute to fit collector limits. Drop to `no_tool_content` to keep prompts but hash tool input and output, the surface where secrets flow. Drop to `metadata_only` to emit only byte counts, line counts, and a hash, with no raw payloads leaving the machine. The hashes still let you correlate and dedupe across sessions without exfiltrating the underlying text. Three modes, no code changes.
 
@@ -216,7 +219,7 @@ Anything you put in `OTEL_RESOURCE_ATTRIBUTES` overrides or extends these.
 npm test
 ```
 
-159 tests across six layers: config resolution, attribute helpers, the span tracker, the SDK lifecycle, the `/otel-status` command, and an end-to-end run over a loopback OTLP/HTTP sink. The end-to-end test replays a full session through a fake `ExtensionAPI` and asserts that traces, metrics, and logs all arrive over HTTP with the documented span names.
+163 tests across six layers: config resolution, attribute helpers, the span tracker, the SDK lifecycle, the `/otel-status` command, and an end-to-end run over a loopback OTLP/HTTP sink. The end-to-end test replays a full session through a fake `ExtensionAPI` and asserts that traces, metrics, and logs all arrive over HTTP with the documented span names.
 
 ## License
 
