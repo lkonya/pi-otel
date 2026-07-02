@@ -219,7 +219,7 @@ Anything you put in `OTEL_RESOURCE_ATTRIBUTES` overrides or extends these.
 npm test
 ```
 
-163 tests across six layers: config resolution, attribute helpers, the span tracker, the SDK lifecycle, the `/otel-status` command, and an end-to-end run over a loopback OTLP/HTTP sink. The end-to-end test replays a full session through a fake `ExtensionAPI` and asserts that traces, metrics, and logs all arrive over HTTP with the documented span names.
+Tests span six layers: config resolution, attribute helpers, the span tracker, the SDK lifecycle, the `/otel-status` command, and an end-to-end run over a loopback OTLP/HTTP sink. The end-to-end test replays a full session through a fake `ExtensionAPI` and asserts that traces, metrics, and logs all arrive over HTTP with the documented span names.
 
 ## License
 
