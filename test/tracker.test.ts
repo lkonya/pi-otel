@@ -355,6 +355,43 @@ describe("tool spans", () => {
     await h.flush();
     assert.ok(h.spansByName()["pi.tool.bash"], "real tool span still present");
   });
+
+  test("tool span links to open llm_request span", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("claude-4", "anthropic");
+    h.tracker.startTool("call_1", "bash", { command: "ls" });
+    h.tracker.endTool("call_1", false, { output: "file.txt" });
+    h.tracker.completeLlm(asstMsg({ stopReason: "tool_use" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const spans = h.spansByName();
+    const tool = spans["pi.tool.bash"];
+    const llm = spans[SPAN_LLM_REQUEST];
+    assert.ok(tool, "tool span present");
+    assert.ok(llm, "llm span present");
+    assert.equal(tool.links.length, 1);
+    assert.equal(tool.links[0].context.traceId, llm.spanContext().traceId);
+    assert.equal(tool.links[0].context.spanId, llm.spanContext().spanId);
+  });
+
+  test("tool span has no links when llm_request is not open", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startTool("t1", "bash", { command: "bad" });
+    h.tracker.endTool("t1", false, {});
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const tool = h.spansByName()["pi.tool.bash"];
+    assert.ok(tool, "tool span present");
+    assert.equal(tool.links.length, 0);
+  });
 });
 
 // ---------------------------------------------------------------------------

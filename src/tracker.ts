@@ -27,6 +27,7 @@ import {
   SpanKind,
   SpanStatusCode,
   type Span,
+  type SpanContext,
   type Tracer,
   context as otelContext,
   trace,
@@ -521,7 +522,11 @@ export class SpanTracker {
     if (shouldCaptureToolContent() && input !== undefined) {
       attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] = clampAttr(input);
     }
-    const span = this.opts.tracer.startSpan(spanToolName(toolName), { attributes: attrs }, parent);
+    const spanOptions: { attributes: Attributes; links?: Array<{ context: SpanContext }> } = { attributes: attrs };
+    if (this.llm) {
+      spanOptions.links = [{ context: this.llm.span.spanContext() }];
+    }
+    const span = this.opts.tracer.startSpan(spanToolName(toolName), spanOptions, parent);
     this.tools.set(toolCallId, {
       span,
       ctx: trace.setSpan(parent, span),
