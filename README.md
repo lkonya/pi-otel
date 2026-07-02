@@ -18,9 +18,9 @@ pi.session                       root span, one per session
       └─ pi.tool.<name>          one per tool call, sibling of the LLM span
 ```
 
-The LLM span is a `CLIENT` span carrying the GenAI semantic conventions. Backends that understand `gen_ai.*` (Aspire, Langfuse, Phoenix, SigNoz, Grafana Tempo, Honeycomb, Datadog) render it as a model call with token usage, cost, model, and finish reason, no extra configuration on their side.
+The LLM span is a `CLIENT` span carrying the GenAI semantic conventions. Backends that understand `gen_ai.*` render it as a model call with token usage, cost, model, and finish reason, no extra configuration on their side.
 
-Tool spans sit as siblings of the LLM span under the turn. Tools run after the model returns, so parenting them under the LLM span would misrepresent causality. Each tool span carries a span link back to the LLM span that triggered it, so backends that render links (Tempo, Jaeger, Honeycomb, SigNoz, Grafana) recover the causality without distorting timing. Several other agent exporters parent tools under the model call.
+Tool spans sit as siblings of the LLM span under the turn. Tools run after the model returns, so parenting them under the LLM span would misrepresent causality. Each tool span carries a span link back to the LLM span that triggered it, so backends that render links recover the causality without distorting timing. Several other agent exporters parent tools under the model call.
 
 **Metrics** use the GenAI semconv names where they exist:
 
@@ -37,9 +37,9 @@ Token usage uses a histogram. The semconv is explicit about this. Histograms let
 
 ## Capabilities
 
-**Works with every OTLP backend.** Point the extension at a hosted platform, a self-hosted collector, or a local dev backend. It emits standard OTLP and strict semantic conventions, so the backend does any translation it needs. Auth is standard `OTEL_EXPORTER_OTLP_HEADERS`. Move between Honeycomb, SigNoz, Datadog, Grafana Cloud, Tempo, Jaeger, Aspire, Langfuse, and Phoenix without changing your config.
+**Works with every OTLP backend.** Point the extension at a hosted platform, a self-hosted collector, or a local dev backend. It emits standard OTLP and strict semantic conventions, so the backend does any translation it needs. Auth is standard `OTEL_EXPORTER_OTLP_HEADERS`.
 
-**Speaks GenAI semantic conventions natively.** LLM spans carry the full `gen_ai.*` attribute set: token usage by type, cost, request and response model, response id, finish reasons, tool call id, name, arguments, and result, plus `gen_ai.input.messages` and `gen_ai.output.messages` JSON for Aspire-style AI panels. `gen_ai.system` carries the real provider (`anthropic`, `openai`, `zai`, etc.) so backends group by vendor correctly. Backends that read GenAI semconv render your agent traces as model calls with no extra setup on their side.
+**Speaks GenAI semantic conventions natively.** LLM spans carry the full `gen_ai.*` attribute set: token usage by type, cost, request and response model, response id, finish reasons, tool call id, name, arguments, and result, plus `gen_ai.input.messages` and `gen_ai.output.messages` JSON for AI panels. `gen_ai.system` carries the real provider (`anthropic`, `openai`, `zai`, etc.) so backends group by vendor correctly. Backends that read GenAI semconv render your agent traces as model calls with no extra setup on their side.
 
 **Captures Anthropic's 1-hour cache split.** Anthropic reports cache writes two ways: 5-minute retention and 1-hour retention, at different prices. Most agent exporters fold both into `cache_write` and lose the split, which makes cost analysis wrong. You get both `gen_ai.usage.cache_write_input_tokens` and `gen_ai.usage.cache_write_1h_input_tokens`, so your cost dashboards stay accurate.
 
@@ -87,7 +87,7 @@ Then `/reload` in pi, or restart.
 
 Point the extension at an OTLP/HTTP backend and run pi.
 
-Local Jaeger for development:
+Local Jaeger for development (used here as a local, OTLP-native backend with a built-in trace UI; the extension works with any OTLP receiver):
 
 ```bash
 docker run --rm -p 16686:16686 -p 4318:4318 \
@@ -116,7 +116,7 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://my-collector:4318
 pi
 ```
 
-Put a collector in front for batching, tail-sampling, redaction, and any platform-specific translation.
+Put a collector in front for batching, tail-sampling, redaction, and any platform-specific translation. See [docs/collector-getting-started.md](docs/collector-getting-started.md) for a ready-to-run docker compose setup, a tail-sampling config tuned for agent traces, and prompt-redaction examples.
 
 ### gRPC instead of HTTP
 
