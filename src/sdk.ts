@@ -21,14 +21,8 @@ import {
 import type { SpanExporter } from "@opentelemetry/sdk-trace-base";
 import type { PushMetricExporter } from "@opentelemetry/sdk-metrics";
 import type { LogRecordExporter } from "@opentelemetry/sdk-logs";
-import { OTLPLogExporter as LogGrpcExporter } from "@opentelemetry/exporter-logs-otlp-grpc";
-import { OTLPLogExporter as LogHttpExporter } from "@opentelemetry/exporter-logs-otlp-http";
 import { OTLPLogExporter as LogProtoExporter } from "@opentelemetry/exporter-logs-otlp-proto";
-import { OTLPMetricExporter as MetricGrpcExporter } from "@opentelemetry/exporter-metrics-otlp-grpc";
-import { OTLPMetricExporter as MetricHttpExporter } from "@opentelemetry/exporter-metrics-otlp-http";
 import { OTLPMetricExporter as MetricProtoExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
-import { OTLPTraceExporter as TraceGrpcExporter } from "@opentelemetry/exporter-trace-otlp-grpc";
-import { OTLPTraceExporter as TraceHttpExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { OTLPTraceExporter as TraceProtoExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import {
   detectResources,
@@ -104,19 +98,37 @@ export interface ExporterOpts {
   headers: Record<string, string>;
 }
 
-function newTraceExporter(p: Protocol, o: ExporterOpts): SpanExporter {
-  if (p === "grpc") return new TraceGrpcExporter(o);
-  if (p === "http/json") return new TraceHttpExporter(o);
+async function newTraceExporter(p: Protocol, o: ExporterOpts): Promise<SpanExporter> {
+  if (p === "grpc") {
+    const { OTLPTraceExporter } = await import("@opentelemetry/exporter-trace-otlp-grpc");
+    return new OTLPTraceExporter(o);
+  }
+  if (p === "http/json") {
+    const { OTLPTraceExporter } = await import("@opentelemetry/exporter-trace-otlp-http");
+    return new OTLPTraceExporter(o);
+  }
   return new TraceProtoExporter(o);
 }
-function newMetricExporter(p: Protocol, o: ExporterOpts): PushMetricExporter {
-  if (p === "grpc") return new MetricGrpcExporter(o);
-  if (p === "http/json") return new MetricHttpExporter(o);
+async function newMetricExporter(p: Protocol, o: ExporterOpts): Promise<PushMetricExporter> {
+  if (p === "grpc") {
+    const { OTLPMetricExporter } = await import("@opentelemetry/exporter-metrics-otlp-grpc");
+    return new OTLPMetricExporter(o);
+  }
+  if (p === "http/json") {
+    const { OTLPMetricExporter } = await import("@opentelemetry/exporter-metrics-otlp-http");
+    return new OTLPMetricExporter(o);
+  }
   return new MetricProtoExporter(o);
 }
-function newLogExporter(p: Protocol, o: ExporterOpts): LogRecordExporter {
-  if (p === "grpc") return new LogGrpcExporter(o);
-  if (p === "http/json") return new LogHttpExporter(o);
+async function newLogExporter(p: Protocol, o: ExporterOpts): Promise<LogRecordExporter> {
+  if (p === "grpc") {
+    const { OTLPLogExporter } = await import("@opentelemetry/exporter-logs-otlp-grpc");
+    return new OTLPLogExporter(o);
+  }
+  if (p === "http/json") {
+    const { OTLPLogExporter } = await import("@opentelemetry/exporter-logs-otlp-http");
+    return new OTLPLogExporter(o);
+  }
   return new LogProtoExporter(o);
 }
 
@@ -257,7 +269,7 @@ export async function startRuntime(
         if (token === "none") continue;
         if (token === "otlp") {
           const exporter = trackHealth(
-            newTraceExporter(cfg.protocol, { url: cfg.tracesEndpoint, headers: cfg.headers }),
+            await newTraceExporter(cfg.protocol, { url: cfg.tracesEndpoint, headers: cfg.headers }),
             (ok, err) => {
               if (ok) { health.spansExported++; health.tracesError = undefined; }
               else { health.tracesError = err; }
@@ -293,7 +305,7 @@ export async function startRuntime(
         if (token === "none") continue;
         if (token === "otlp") {
           const exporter = trackHealth(
-            newMetricExporter(cfg.protocol, { url: cfg.metricsEndpoint, headers: cfg.headers }),
+            await newMetricExporter(cfg.protocol, { url: cfg.metricsEndpoint, headers: cfg.headers }),
             (ok, err) => {
               if (ok) { health.metricBatchesExported++; health.metricsError = undefined; }
               else { health.metricsError = err; }
@@ -327,7 +339,7 @@ export async function startRuntime(
         if (token === "none") continue;
         if (token === "otlp") {
           const exporter = trackHealth(
-            newLogExporter(cfg.protocol, { url: cfg.logsEndpoint, headers: cfg.headers }),
+            await newLogExporter(cfg.protocol, { url: cfg.logsEndpoint, headers: cfg.headers }),
             (ok, err) => {
               if (ok) { health.logRecordsExported++; health.logsError = undefined; }
               else { health.logsError = err; }
