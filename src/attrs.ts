@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * OpenTelemetry attribute constants.
  *
@@ -15,7 +17,7 @@
 // gen_ai.* (GenAI semantic conventions)
 // ---------------------------------------------------------------------------
 
-/** Value used for `gen_ai.system` across all telemetry from this extension. */
+/** Agent harness identity (pi), not an AI vendor. Do not use as `gen_ai.system` on spans. */
 export const GEN_AI_SYSTEM = "pi";
 
 export const ATTR_GEN_AI_SYSTEM = "gen_ai.system";
@@ -46,12 +48,14 @@ export const ATTR_GEN_AI_TOOL_CALL_RESULT = "gen_ai.tool.call.result";
 // on the LLM span instead of (or in addition to) the gen_ai.*.message events.
 export const ATTR_GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages";
 export const ATTR_GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages";
+export const ATTR_GEN_AI_SYSTEM_PROMPT_HASH = "gen_ai.system.prompt.hash";
 
 // gen_ai.* span events (older message-pipeline convention)
 export const EVENT_GEN_AI_USER_MESSAGE = "gen_ai.user.message";
 export const EVENT_GEN_AI_TOOL_MESSAGE = "gen_ai.tool.message";
 export const EVENT_GEN_AI_ASSISTANT_MESSAGE = "gen_ai.assistant.message";
 export const EVENT_GEN_AI_CHOICE = "gen_ai.choice";
+export const EVENT_GEN_AI_FIRST_TOKEN = "gen_ai.first_token";
 
 // ---------------------------------------------------------------------------
 // error / http
@@ -81,6 +85,7 @@ export const ATTR_PI_USER_PROMPT = "pi.user_prompt";
 export const ATTR_PI_INTERACTION_ID = "pi.interaction.id";
 export const ATTR_PI_CANCELLED = "pi.cancelled";
 export const ATTR_PI_ORPHANED = "pi.orphaned";
+export const ATTR_PI_ERROR_COUNT = "pi.error_count";
 
 // ---------------------------------------------------------------------------
 // Span names
@@ -184,6 +189,16 @@ function safeStringify(value: unknown): string {
  * Structural fingerprint for content we are NOT capturing raw.
  * Lets you correlate/dedupe in the backend without exfiltrating the payload.
  */
+/**
+ * Stable short SHA-256 hex prefix for a system prompt (one-way; safe to export).
+ * Returns undefined for empty or whitespace-only input.
+ */
+export function hashPrompt(prompt: string): string | undefined {
+  const trimmed = prompt.trim();
+  if (!trimmed) return undefined;
+  return createHash("sha256").update(trimmed, "utf8").digest("hex").slice(0, 16);
+}
+
 export function fingerprint(value: unknown): Record<string, number | string> {
   const s = typeof value === "string" ? value : safeStringify(value);
   const bytes = Buffer.byteLength(s, "utf8");

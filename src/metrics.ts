@@ -15,6 +15,8 @@ const METER_VERSION = "0.1.0";
 export interface Metrics {
   /** gen_ai.client.operation.duration (s) — LLM request latency. */
   opDuration: Histogram;
+  /** gen_ai.client.time_to_first_token (s) — request start to first streamed token. */
+  timeToFirstToken: Histogram;
   /** gen_ai.client.token.usage ({token}) — tokens per LLM request, by token type. */
   tokenUsage: Histogram;
   /** gen_ai.client.tool.calls ({call}) — tool invocations. */
@@ -44,6 +46,10 @@ export function getMetrics(provider: MeterProvider | null | undefined): Metrics 
   cached = {
     opDuration: meter.createHistogram("gen_ai.client.operation.duration", {
       description: "Duration of GenAI client operations",
+      unit: "s",
+    }),
+    timeToFirstToken: meter.createHistogram("gen_ai.client.time_to_first_token", {
+      description: "Time from LLM request start to first streamed token",
       unit: "s",
     }),
     tokenUsage: meter.createHistogram("gen_ai.client.token.usage", {

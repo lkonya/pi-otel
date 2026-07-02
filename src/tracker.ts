@@ -53,6 +53,7 @@ import {
   ATTR_GEN_AI_RESPONSE_MODEL,
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_SYSTEM,
+  ATTR_GEN_AI_SYSTEM_PROMPT_HASH,
   ATTR_GEN_AI_TOKEN_TYPE,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
   ATTR_GEN_AI_TOOL_CALL_ID,
@@ -61,6 +62,7 @@ import {
   ATTR_HTTP_STATUS_CODE,
   ATTR_PI_CANCELLED,
   ATTR_PI_CWD,
+  ATTR_PI_ERROR_COUNT,
   ATTR_PI_INTERACTION_ID,
   ATTR_PI_ORPHANED,
   ATTR_PI_PROMPT_LENGTH,
@@ -75,9 +77,10 @@ import {
   clampAttr,
   EVENT_GEN_AI_ASSISTANT_MESSAGE,
   EVENT_GEN_AI_CHOICE,
+  EVENT_GEN_AI_FIRST_TOKEN,
   EVENT_GEN_AI_TOOL_MESSAGE,
   EVENT_GEN_AI_USER_MESSAGE,
-  GEN_AI_SYSTEM,
+  hashPrompt,
   SPAN_INTERACTION,
   SPAN_LLM_REQUEST,
   SPAN_SESSION,
@@ -120,6 +123,25 @@ interface ToolSlot extends TimedSlot {
 
 const OP_NAME_CHAT = "chat";
 
+function categorizeHttpError(status: number): string {
+  if (status === 408) return "timeout";
+  if (status === 413) return "request_too_large";
+  if (status === 429) return "rate_limit";
+  if (status === 401 || status === 403) return "auth_error";
+  if (status >= 500) return "server_error";
+  if (status >= 400) return "client_error";
+  return "client_error";
+}
+
+function categorizeThrownError(combined: string, errName: string): string {
+  if (/timeout|abort/i.test(combined)) return "timeout";
+  if (/rate.?limit/i.test(combined)) return "rate_limit";
+  if (/auth|unauthorized|forbidden/i.test(combined)) return "auth_error";
+  if (/context.*(length|window)|too.*(large|long)/i.test(combined)) return "request_too_large";
+  if (/content.?filter|safety/i.test(combined)) return "content_filter";
+  return errName;
+}
+
 export type SessionReason = "startup" | "reload" | "new" | "resume" | "fork";
 
 export class SpanTracker {
@@ -129,6 +151,7 @@ export class SpanTracker {
   private turn: (TimedSlot & { index: number }) | null = null;
   private llm: (TimedSlot & {
     requestModel?: string;
+    providerSystem?: string;
     responseModel?: string;
     toolCallCount?: number;
     inputTokens?: number;
@@ -136,6 +159,7 @@ export class SpanTracker {
     httpStatus?: number;
     attempts: number;
     inputMessages: Array<Record<string, unknown>>;
+    firstTokenSeen?: boolean;
   }) | null = null;
   private tools = new Map<string, ToolSlot>();
 
@@ -147,6 +171,10 @@ export class SpanTracker {
   private readonly now: () => number;
   private readonly orphanTtlMs: number;
   private interactionStartMs = 0;
+  private totalInputTokens = 0;
+  private totalOutputTokens = 0;
+  private totalCostUsd = 0;
+  private errorCount = 0;
 
   constructor(opts: TrackerOptions) {
     this.opts = opts;
@@ -187,6 +215,18 @@ export class SpanTracker {
     if (this.session) {
       this.session.span.setAttribute(ATTR_PI_TURN_COUNT, this.turnCount);
       this.session.span.setAttribute(ATTR_PI_TOOL_COUNT, this.toolCount);
+      if (this.totalInputTokens > 0) {
+        this.session.span.setAttribute(ATTR_GEN_AI_INPUT_TOKENS, this.totalInputTokens);
+      }
+      if (this.totalOutputTokens > 0) {
+        this.session.span.setAttribute(ATTR_GEN_AI_OUTPUT_TOKENS, this.totalOutputTokens);
+      }
+      if (this.totalCostUsd > 0) {
+        this.session.span.setAttribute(ATTR_GEN_AI_COST_USD, this.totalCostUsd);
+      }
+      if (this.errorCount > 0) {
+        this.session.span.setAttribute(ATTR_PI_ERROR_COUNT, this.errorCount);
+      }
       this.session.span.end();
       this.session = null;
     }
@@ -322,7 +362,10 @@ export class SpanTracker {
     const parent = this.turn?.ctx ?? this.interaction?.ctx ?? otelContext.active();
     const attrs = this.commonAttrs();
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
-    if (providerSystem) attrs[ATTR_GEN_AI_AGENT_NAME] = providerSystem;
+    if (providerSystem) {
+      attrs[ATTR_GEN_AI_AGENT_NAME] = providerSystem;
+      attrs[ATTR_GEN_AI_SYSTEM] = providerSystem;
+    }
     if (requestModel) attrs[ATTR_GEN_AI_REQUEST_MODEL] = requestModel;
     const span = this.opts.tracer.startSpan(
       SPAN_LLM_REQUEST,
@@ -334,9 +377,29 @@ export class SpanTracker {
       ctx: trace.setSpan(parent, span),
       startNs: process.hrtime.bigint(),
       requestModel,
+      providerSystem,
       attempts: 0,
       inputMessages: [],
     };
+  }
+
+  noteFirstToken(message: { role?: string }): void {
+    if (!this.llm || message.role !== "assistant" || this.llm.firstTokenSeen) return;
+    this.llm.firstTokenSeen = true;
+    const elapsedSec = Number(process.hrtime.bigint() - this.llm.startNs) / 1e9;
+    const base: Attributes = this.commonAttrs();
+    if (this.llm.requestModel) base[ATTR_GEN_AI_REQUEST_MODEL] = this.llm.requestModel;
+    try {
+      this.opts.metrics()?.timeToFirstToken.record(elapsedSec, base);
+    } catch { /* best-effort */ }
+    this.llm.span.addEvent(EVENT_GEN_AI_FIRST_TOKEN, { elapsed_s: elapsedSec } as Attributes);
+  }
+
+  noteSystemPrompt(prompt: string): void {
+    const hash = hashPrompt(prompt);
+    if (!hash) return;
+    const target = this.interaction?.span ?? this.session?.span;
+    if (target) target.setAttribute(ATTR_GEN_AI_SYSTEM_PROMPT_HASH, hash);
   }
 
   /** Buffer an input message (user or tool result) to flush when the LLM span opens. */
@@ -352,18 +415,23 @@ export class SpanTracker {
     this.flushPendingInput();
   }
 
+  private llmEventGenAiSystem(): Record<string, string> | undefined {
+    const ps = this.llm?.providerSystem;
+    return ps ? { [ATTR_GEN_AI_SYSTEM]: ps } : undefined;
+  }
+
   private flushPendingInput(): void {
     if (!this.llm || this.pendingInput.length === 0) return;
     for (const m of this.pendingInput) {
       if (m.role === "user") {
-        const attrs: Record<string, unknown> = { role: "user", [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM };
+        const attrs: Record<string, unknown> = { role: "user", ...this.llmEventGenAiSystem() };
         if (shouldCapturePrompt()) attrs.content = clampAttr(m.text);
         this.llm.span.addEvent(EVENT_GEN_AI_USER_MESSAGE, attrs as Attributes);
         this.llm.inputMessages.push({ role: "user", parts: [{ type: "text", content: m.text }] });
       } else if (shouldCaptureToolContent()) {
         const attrs: Record<string, unknown> = {
           role: "tool",
-          [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM,
+          ...this.llmEventGenAiSystem(),
           [ATTR_GEN_AI_TOOL_CALL_ID]: m.toolCallId ?? "",
           ...(m.toolName ? { [ATTR_GEN_AI_TOOL_NAME]: m.toolName } : {}),
           content: clampAttr(m.text),
@@ -396,7 +464,8 @@ export class SpanTracker {
       } catch { /* noop */ }
     }
     if (status >= 400) {
-      this.llm.span.setAttribute("error.type", `http_${status}`);
+      this.errorCount++;
+      this.llm.span.setAttribute("error.type", categorizeHttpError(status));
       this.llm.span.setStatus({ code: SpanStatusCode.ERROR, message: `HTTP ${status}` });
     }
     return retry;
@@ -414,6 +483,7 @@ export class SpanTracker {
     const finish = message.stopReason;
     if (finish) llm.span.setAttribute(ATTR_GEN_AI_RESPONSE_FINISH_REASONS, [finish]);
     this.applyUsageAttrs(message);
+    this.accumulateSessionUsageFromMessage(message);
     this.emitAssistantMessageEvents(message);
     llm.toolCallCount = countToolCalls(message);
     this.recordLlmMetrics();
@@ -486,13 +556,13 @@ export class SpanTracker {
     const text = extractAssistantText(m);
     const toolCalls = extractToolCalls(m);
     if (shouldCapturePrompt()) {
-      const asstAttrs: Record<string, unknown> = { role: "assistant", [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM };
+      const asstAttrs: Record<string, unknown> = { role: "assistant", ...this.llmEventGenAiSystem() };
       if (text) asstAttrs.content = clampAttr(text);
       if (toolCalls.length) asstAttrs["tool_calls"] = clampAttr(toolCalls);
       this.llm.span.addEvent(EVENT_GEN_AI_ASSISTANT_MESSAGE, asstAttrs as Attributes);
       const finish = m.stopReason ?? "stop";
       this.llm.span.addEvent(EVENT_GEN_AI_CHOICE, {
-        [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM,
+        ...this.llmEventGenAiSystem(),
         index: 0,
         finish_reason: finish,
         message: clampAttr({ role: "assistant", content: text, tool_calls: toolCalls.length ? toolCalls : undefined }),
@@ -570,9 +640,17 @@ export class SpanTracker {
   }
 
   // --------------------------------------------------------------- helpers
+  private accumulateSessionUsageFromMessage(m: MessageShapes.AssistantMessage): void {
+    const u = m.usage;
+    if (!u) return;
+    if (typeof u.input === "number" && Number.isFinite(u.input)) this.totalInputTokens += u.input;
+    if (typeof u.output === "number" && Number.isFinite(u.output)) this.totalOutputTokens += u.output;
+    const cost = u.cost?.total;
+    if (typeof cost === "number" && Number.isFinite(cost)) this.totalCostUsd += cost;
+  }
+
   private commonAttrs(): Attributes {
     const attrs: Attributes = {
-      [ATTR_GEN_AI_SYSTEM]: GEN_AI_SYSTEM,
       [ATTR_PI_CWD]: this.opts.cwd,
     };
     const sid = this.opts.sessionId();
@@ -586,9 +664,11 @@ export class SpanTracker {
     if (!error) return;
     const errName = error instanceof Error ? error.name : "Error";
     const errMsg = error instanceof Error ? error.message : String(error);
-    span.setAttribute("error.type", errName);
+    const combined = `${errName} ${errMsg}`;
+    span.setAttribute("error.type", categorizeThrownError(combined, errName));
     span.setAttribute("exception.message", errMsg);
     span.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
+    if (this.llm && span === this.llm.span) this.errorCount++;
   }
 
   /** Mark all active spans as cancelled (Esc/abort). */

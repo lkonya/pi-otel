@@ -13,6 +13,7 @@ import {
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_ID,
   ATTR_GEN_AI_SYSTEM,
+  ATTR_GEN_AI_SYSTEM_PROMPT_HASH,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
@@ -26,6 +27,8 @@ import {
   ATTR_PI_CANCELLED,
   ATTR_PI_ORPHANED,
   ATTR_PI_INTERACTION_ID,
+  ATTR_PI_ERROR_COUNT,
+  hashPrompt,
   SPAN_SESSION,
   SPAN_INTERACTION,
   SPAN_TURN,
@@ -120,12 +123,13 @@ describe("span tree shape", () => {
 });
 
 describe("common attributes", () => {
-  test("every span carries gen_ai.system=pi", async () => {
+  test("llm_request has gen_ai.system from provider; session omits gen_ai.system", async () => {
     runHappyPath(h);
     await h.flush();
-    for (const span of Object.values(h.spansByName())) {
-      assert.equal(span.attributes[ATTR_GEN_AI_SYSTEM], "pi", `${span.name} missing gen_ai.system`);
-    }
+    const spans = h.spansByName();
+    assert.equal(spans[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_SYSTEM], "anthropic");
+    assert.equal(ATTR_GEN_AI_SYSTEM in spans[SPAN_SESSION].attributes, false);
+    assert.equal(ATTR_GEN_AI_SYSTEM in spans[SPAN_INTERACTION].attributes, false);
   });
 
   test("every span carries pi.session.id", async () => {
@@ -279,7 +283,7 @@ describe("llm usage attribution", () => {
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const span = h.spansByName()[SPAN_LLM_REQUEST];
-    assert.equal(span.attributes["error.type"], "http_500");
+    assert.equal(span.attributes["error.type"], "server_error");
     assert.equal(span.status.code, SpanStatusCode.ERROR);
   });
 });
@@ -616,6 +620,147 @@ describe("defensive behavior", () => {
     await bad.flush();
     // The span still ends despite the metric throw.
     assert.ok(bad.spansByName()["pi.tool.bash"]);
+  });
+});
+
+describe("gen_ai.system provider", () => {
+  test("LLM span with providerSystem anthropic sets gen_ai.system", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "anthropic");
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_SYSTEM], "anthropic");
+    assert.equal(ATTR_GEN_AI_SYSTEM in h.spansByName()[SPAN_SESSION].attributes, false);
+  });
+});
+
+describe("session summary attributes", () => {
+  test("session span sums tokens, cost, and error count", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.recordProviderResponse(429, {});
+    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, cost: 0.01, stopReason: "error" }) as never);
+    h.tracker.startTurn(1);
+    h.tracker.startLlm("m", "p");
+    h.tracker.completeLlm(asstMsg({ input: 20, output: 15, cost: 0.02, stopReason: "stop" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const a = h.spansByName()[SPAN_SESSION].attributes;
+    assert.equal(a[ATTR_GEN_AI_INPUT_TOKENS], 30);
+    assert.equal(a[ATTR_GEN_AI_OUTPUT_TOKENS], 20);
+    assert.equal(a[ATTR_GEN_AI_COST_USD], 0.03);
+    assert.equal(a[ATTR_PI_ERROR_COUNT], 1);
+  });
+
+  test("session with no LLM activity omits usage summary attrs", async () => {
+    h.tracker.startSession();
+    h.tracker.endSession();
+    await h.flush();
+    const a = h.spansByName()[SPAN_SESSION].attributes;
+    assert.equal(ATTR_GEN_AI_INPUT_TOKENS in a, false);
+    assert.equal(ATTR_GEN_AI_OUTPUT_TOKENS in a, false);
+    assert.equal(ATTR_GEN_AI_COST_USD in a, false);
+    assert.equal(ATTR_PI_ERROR_COUNT in a, false);
+  });
+});
+
+describe("time to first token", () => {
+  function metricsWithTtft(r: RecordingMetrics) {
+    const m = recordingMetricsOf(r);
+    (m as { timeToFirstToken: ReturnType<RecordingMetrics["histogram"]> }).timeToFirstToken = r.histogram("ttft");
+    return m;
+  }
+
+  test("first assistant message_update records TTFT event and histogram once", async () => {
+    const spanExporter = h.spanExporter;
+    const rec = h.metrics;
+    const tracker = new SpanTracker({
+      tracer: h.tracer,
+      captureContent: "full",
+      sessionId: () => "test-session",
+      sessionFile: () => "/tmp/test.jsonl",
+      cwd: "/test",
+      metrics: () => metricsWithTtft(rec),
+    });
+    tracker.startSession();
+    tracker.startInteraction("p");
+    tracker.startTurn(0);
+    tracker.startLlm("claude-4", "anthropic");
+    tracker.noteFirstToken({ role: "assistant" });
+    tracker.noteFirstToken({ role: "assistant" });
+    tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    tracker.endTurn();
+    tracker.endInteraction();
+    tracker.endSession();
+    await h.flush();
+    const llm = spanExporter.getFinishedSpans().find(s => s.name === SPAN_LLM_REQUEST);
+    assert.ok(llm);
+    const firstTokenEvents = llm!.events.filter(e => e.name === "gen_ai.first_token");
+    assert.equal(firstTokenEvents.length, 1);
+    assert.ok(rec.histograms["ttft"]?.length === 1);
+  });
+});
+
+describe("system prompt hash", () => {
+  test("noteSystemPrompt sets hash on interaction span", async () => {
+    const prompt = "You are a helpful assistant.";
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.noteSystemPrompt(prompt);
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const expected = hashPrompt(prompt);
+    assert.equal(h.spansByName()[SPAN_INTERACTION].attributes[ATTR_GEN_AI_SYSTEM_PROMPT_HASH], expected);
+  });
+
+  test("empty or whitespace prompt does not set hash", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.noteSystemPrompt("   ");
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    assert.equal(ATTR_GEN_AI_SYSTEM_PROMPT_HASH in h.spansByName()[SPAN_INTERACTION].attributes, false);
+  });
+});
+
+describe("error categorization", () => {
+  test("recordProviderResponse 429 sets rate_limit", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.recordProviderResponse(429, {});
+    h.tracker.completeLlm(asstMsg({ stopReason: "error" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes["error.type"], "rate_limit");
+  });
+
+  test("recordProviderResponse 500 sets server_error", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.recordProviderResponse(500, {});
+    h.tracker.completeLlm(asstMsg({ stopReason: "error" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes["error.type"], "server_error");
   });
 });
 

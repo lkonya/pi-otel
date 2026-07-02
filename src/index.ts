@@ -180,6 +180,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event, ctx) => {
     lastCtx = ctx;
     tracker?.startInteraction(event.prompt);
+    tracker?.noteSystemPrompt(event.systemPrompt);
   });
 
   pi.on("turn_start", async (event, ctx) => {
@@ -216,6 +217,10 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("after_provider_response", async (event, _ctx) => {
     tracker?.recordProviderResponse(event.status, event.headers ?? {});
+  });
+
+  pi.on("message_update", async (event, _ctx) => {
+    tracker?.noteFirstToken(event.message);
   });
 
   // Capture input messages for the gen_ai.input.messages attribute.
