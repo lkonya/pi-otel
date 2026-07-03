@@ -1,6 +1,6 @@
 # pi-otel
 
-OpenTelemetry traces, metrics, and logs for the [pi coding agent](https://github.com/earendil-works/pi-coding-agent).
+OpenTelemetry traces, metrics, and logs for the [pi coding agent](https://github.com/earendil-works/pi).
 
 The extension is a pure OTLP exporter. It speaks the OpenTelemetry wire protocol and emits strict semantic conventions (`gen_ai.*`, `service.*`, `process.*`, `host.*`). Point it at a hosted platform, a collector, or a local dev backend. Whatever you point it at does any translation it needs.
 
