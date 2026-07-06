@@ -195,8 +195,12 @@ export default function (pi: ExtensionAPI): void {
       signal.addEventListener(
         "abort",
         () => {
-          tracker?.markCancelled();
-          try { getMetrics(runtime?.meterProvider)?.turnCancellations.add(1); } catch { /* noop */ }
+          // Only count aborts that actually cancelled an in-flight turn, so
+          // mashing Esc outside a turn does not inflate the counter.
+          const cancelled = tracker?.markCancelled() ?? false;
+          if (cancelled) {
+            try { getMetrics(runtime?.meterProvider)?.turnCancellations.add(1); } catch { /* noop */ }
+          }
         },
         { once: true },
       );

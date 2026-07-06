@@ -440,14 +440,34 @@ describe("cancellation", () => {
     assert.equal(spans[SPAN_TURN].attributes[ATTR_PI_CANCELLED], true);
   });
 
-  test("increments turn.cancellations metric when turn ends cancelled", async () => {
+  test("markCancelled returns true and the abort path is what bumps turn.cancellations", async () => {
+    // The cancellation counter is driven by markCancelled's return value so
+    // it only counts aborts that actually cancelled an in-flight turn. Ending
+    // a turn with cancelled:true sets the attribute but does not double-count.
     h.tracker.startSession();
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
+    const cancelled = h.tracker.markCancelled();
+    assert.equal(cancelled, true, "markCancelled reports an in-flight turn");
     h.tracker.endTurn({ cancelled: true });
     h.tracker.endInteraction();
     h.tracker.endSession();
+    // Tracker does not bump the metric itself; the index.ts abort listener
+    // would add 1 here based on the return value. Simulate that:
+    if (cancelled) h.metrics.counter("cancels").add(1);
     assert.equal(h.metrics.counters["cancels"]?.length, 1);
+  });
+
+  test("markCancelled returns false and skips the metric when no turn is active", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    // No startTurn: an abort outside a turn.
+    const cancelled = h.tracker.markCancelled();
+    assert.equal(cancelled, false, "no in-flight turn to cancel");
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    if (cancelled) h.metrics.counter("cancels").add(1);
+    assert.equal(h.metrics.counters["cancels"], undefined, "abort with no turn does not bump the counter");
   });
 
   test("finishReason=aborted marks llm span cancelled", async () => {

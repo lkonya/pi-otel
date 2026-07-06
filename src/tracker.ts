@@ -358,9 +358,9 @@ export class SpanTracker {
     this.setStatusFromError(span, opts.error);
     span.end();
     this.turn = null;
-    if (opts.cancelled) {
-      try { this.opts.metrics()?.turnCancellations.add(1, this.commonAttrs()); } catch { /* noop */ }
-    }
+    // The turn-cancellation metric is bumped from markCancelled so it only
+    // counts aborts that actually cancelled an in-flight turn. The cancelled
+    // flag here only drives the span attribute.
   }
 
   // ------------------------------------------------------------- llm spans
@@ -692,12 +692,20 @@ export class SpanTracker {
     if (this.llm && span === this.llm.span) this.errorCount++;
   }
 
-  /** Mark all active spans as cancelled (Esc/abort). */
-  markCancelled(): void {
+  /**
+   * Mark all active spans as cancelled (Esc/abort).
+   * Returns true when there was an in-flight turn to cancel, false otherwise
+   * (e.g. the abort fired outside a turn). Callers use the return value to
+   * decide whether to bump the turn-cancellation metric so it does not count
+   * aborts with nothing to cancel.
+   */
+  markCancelled(): boolean {
     if (this.llm) this.llm.span.setAttribute(ATTR_PI_CANCELLED, true);
     for (const [, slot] of this.tools) slot.span.setAttribute(ATTR_PI_CANCELLED, true);
+    const hadTurn = this.turn !== null;
     if (this.turn) this.turn.span.setAttribute(ATTR_PI_CANCELLED, true);
     if (this.interaction) this.interaction.span.setAttribute(ATTR_PI_CANCELLED, true);
+    return hadTurn;
   }
 
   /** Surface the active interaction's trace id (e.g. for UI display). */
