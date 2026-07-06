@@ -11,7 +11,7 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import { InMemoryLogRecordExporter } from "@opentelemetry/sdk-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import { shutdownProviders, startRuntime, type ExportHealth } from "../src/sdk.ts";
+import { shutdownProviders, startRuntime, detectHostId, type ExportHealth } from "../src/sdk.ts";
 import { resolveConfig } from "../src/config.ts";
 
 /**
@@ -295,3 +295,16 @@ describe("per-signal exporters", () => {
 
 // Re-exports used only for the type narrowing above.
 void diag; void InMemorySpanExporter; void InMemoryLogRecordExporter;
+
+describe("detectHostId", () => {
+  test("returns a non-empty string", () => {
+    const id = detectHostId();
+    assert.ok(typeof id === "string");
+    assert.ok(id.length > 0, "host id is non-empty");
+  });
+
+  test("on non-linux platforms it falls back to hostname", { skip: process.platform === "linux" }, () => {
+    // On non-linux there is no machine-id file; the result must equal hostname().
+    assert.equal(detectHostId(), require("node:os").hostname());
+  });
+});

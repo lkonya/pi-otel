@@ -12,7 +12,6 @@
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { hostname, userInfo, version as nodeVersion } from "node:os";
-import { execSync } from "node:child_process";
 import {
   diag,
   type DiagLogger,
@@ -158,17 +157,15 @@ function trackHealth<T>(exporter: T, onResult: (ok: boolean, errMsg?: string) =>
 /**
  * Detect a stable host.id. Falls back to hostname when no platform id exists.
  */
-function detectHostId(): string {
+export function detectHostId(): string {
   if (process.platform === "linux") {
-    try {
-      const id = execSync("cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null", {
-        encoding: "utf8",
-        timeout: 500,
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-      if (id) return id;
-    } catch {
-      // ignore
+    for (const candidate of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
+      try {
+        const id = readFileSync(candidate, "utf8").trim();
+        if (id) return id;
+      } catch {
+        // missing or unreadable — try the next candidate
+      }
     }
   }
   return hostname();
