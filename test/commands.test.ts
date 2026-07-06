@@ -175,3 +175,54 @@ describe("otel-status command", () => {
     assert.equal(text, "pi-otel: disabled (no telemetry runtime)");
   });
 });
+
+describe("otel-flush and otel-test commands", () => {
+  // These commands must work headless (hasUI: false). An earlier version
+  // called ctx.ui.notify unconditionally in otel-flush/otel-test and would
+  // throw when pi ran without a UI.
+  function captureLog(fn: () => Promise<void>): Promise<string> {
+    const fakeCtx = { hasUI: false } as unknown as ExtensionContext;
+    const orig = console.log;
+    let captured = "";
+    return (async () => {
+      try {
+        console.log = (s: string) => { captured = s; };
+        await fn();
+      } finally {
+        console.log = orig;
+      }
+      // otel-test may emit multiple lines (warning prefix); keep the last.
+      void fakeCtx;
+      return captured;
+    })();
+  }
+
+  test("otel-flush does not throw headless and prints a confirmation", async () => {
+    let flushed = false;
+    const rt = minimalRuntime({}, { spansExported: 0, metricBatchesExported: 0, logRecordsExported: 0 });
+    rt.flush = async () => { flushed = true; };
+    const { commands } = captureRegisterCommands(() => rt);
+    const fakeCtx = { hasUI: false } as unknown as ExtensionContext;
+    await commands["otel-flush"].handler([], fakeCtx); // must not throw
+    assert.equal(flushed, true, "flush was called");
+    const out = await captureLog(() => commands["otel-flush"].handler([], fakeCtx));
+    assert.match(out, /pi-otel: flushed/);
+  });
+
+  test("otel-test does not throw headless with all signals disabled", async () => {
+    const rt = minimalRuntime(
+      { traces: { enabled: false }, metrics: { enabled: false }, logs: { enabled: false } },
+      { spansExported: 0, metricBatchesExported: 0, logRecordsExported: 0 },
+    );
+    rt.flush = async () => {};
+    const { commands } = captureRegisterCommands(() => rt);
+    const out = await captureLog(() => commands["otel-test"].handler([], { hasUI: false } as unknown as ExtensionContext));
+    assert.match(out, /all signals disabled/);
+  });
+
+  test("otel-flush with no runtime prints the disabled message headless", async () => {
+    const { commands } = captureRegisterCommands(() => null);
+    const out = await captureLog(() => commands["otel-flush"].handler([], { hasUI: false } as unknown as ExtensionContext));
+    assert.match(out, /pi-otel: disabled/);
+  });
+});

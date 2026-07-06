@@ -10,6 +10,11 @@ import { emitLog } from "./logging.js";
 // (ATTR_TEST_FLAG removed — use the literal "pi.test" inline.)
 
 export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRuntime | null): void {
+  // console.log in headless, ctx.ui.notify in the TUI. Keeps /otel-* usable
+  // both ways without each handler repeating the guard.
+  const notify = (ctx: ExtensionContext, msg: string, level: "info" | "warning"): void => {
+    ctx.hasUI ? ctx.ui.notify(msg, level) : console.log(`${level.toUpperCase()}: ${msg}`);
+  };
   pi.registerCommand("otel-status", {
     description: "Show pi-otel configuration and export health",
     handler: async (_args, ctx: ExtensionContext) => {
@@ -41,7 +46,7 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
         `last shutdown err  ${h.lastShutdownError ?? "(none)"}`,
       ];
       const text = lines.join("\n");
-      ctx.hasUI ? ctx.ui.notify(text, "info") : console.log(text);
+      notify(ctx, text, "info");
     },
   });
 
@@ -50,11 +55,11 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
     handler: async (_args, ctx: ExtensionContext) => {
       const rt = getRuntime();
       if (!rt) {
-        ctx.ui.notify("pi-otel: disabled", "warning");
+        notify(ctx, "pi-otel: disabled", "warning");
         return;
       }
       await rt.flush();
-      ctx.ui.notify("pi-otel: flushed", "info");
+      notify(ctx, "pi-otel: flushed", "info");
     },
   });
 
@@ -63,7 +68,7 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
     handler: async (_args, ctx: ExtensionContext) => {
       const rt = getRuntime();
       if (!rt) {
-        ctx.ui.notify("pi-otel: disabled", "warning");
+        notify(ctx, "pi-otel: disabled", "warning");
         return;
       }
       const c = rt.config;
@@ -93,7 +98,8 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
       }
       await rt.flush();
       const ok = c.traces.enabled || c.metrics.enabled || c.logs.enabled;
-      ctx.ui.notify(
+      notify(
+        ctx,
         ok
           ? `pi-otel: emitted self-test (traces=${c.traces.enabled}, metrics=${c.metrics.enabled}, logs=${c.logs.enabled}). Check your backend.`
           : "pi-otel: all signals disabled",
