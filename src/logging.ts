@@ -14,9 +14,10 @@ import type { Logger } from "@opentelemetry/api-logs";
 import { SeverityNumber, type LogAttributes } from "@opentelemetry/api-logs";
 import type { LoggerProvider } from "@opentelemetry/sdk-logs";
 import type { ContentCapture } from "./attrs.js";
+import { extensionVersion } from "./version.js";
 
 const LOGGER_NAME = "pi-otel";
-const LOGGER_VERSION = "0.1.0";
+const LOGGER_VERSION = extensionVersion();
 
 let cachedLogger: Logger | null = null;
 

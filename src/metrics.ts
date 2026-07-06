@@ -8,9 +8,10 @@
  */
 
 import { type Counter, type Histogram, type MeterProvider } from "@opentelemetry/api";
+import { extensionVersion } from "./version.js";
 
 const METER_NAME = "pi-otel";
-const METER_VERSION = "0.1.0";
+const METER_VERSION = extensionVersion();
 
 export interface Metrics {
   /** gen_ai.client.operation.duration (s) — LLM request latency. */

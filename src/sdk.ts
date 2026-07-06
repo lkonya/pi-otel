@@ -12,6 +12,7 @@
 import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { hostname, userInfo, version as nodeVersion } from "node:os";
+import { extensionVersion } from "./version.js";
 import {
   diag,
   type DiagLogger,
@@ -59,7 +60,7 @@ import {
 import type { ExporterToken, Protocol, ResolvedConfig } from "./config.js";
 
 const TRACER_NAME = "pi-otel";
-const TRACER_VERSION = "0.1.0";
+const TRACER_VERSION = extensionVersion();
 
 /** Last error observed from any exporter, plus the last shutdown failure.
  * Surfaced via /otel-status. */

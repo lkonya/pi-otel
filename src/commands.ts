@@ -6,6 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { TelemetryRuntime } from "./sdk.js";
 import { SeverityNumber } from "@opentelemetry/api-logs";
 import { emitLog } from "./logging.js";
+import { extensionVersion } from "./version.js";
 
 // (ATTR_TEST_FLAG removed — use the literal "pi.test" inline.)
 
@@ -83,7 +84,7 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
       // --- Metric ---
       if (c.metrics.enabled) {
         // Use the meter via the runtime's provider so it lands in the right exporter.
-        const meter = rt.meterProvider?.getMeter("pi-otel", "0.1.0");
+        const meter = rt.meterProvider?.getMeter("pi-otel", extensionVersion());
         const counter = meter?.createCounter("pi.otel.self_test", {
           description: "pi-otel self-test counter",
           unit: "{event}",
