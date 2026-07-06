@@ -190,6 +190,46 @@ describe("end-to-end over real HTTP OTLP", () => {
       delete process.env.PI_OTEL_DISABLED;
     }
   });
+
+  test("lifecycle log events include session end, llm error, and tool error", async () => {
+    resetReceived();
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = ENDPOINT;
+    const { pi, handlers, ctx } = fakePi();
+    const mod = await import("../src/index.ts");
+    mod.default(pi);
+    const emit = async (event: string, payload: any) => {
+      const h = handlers.get(event);
+      if (h) await h({ type: event, ...payload }, ctx);
+    };
+
+    await emit("session_start", { reason: "startup" });
+    await emit("before_agent_start", { prompt: "do a thing", systemPrompt: "" });
+    await emit("turn_start", { turnIndex: 0, timestamp: Date.now() });
+    await emit("before_provider_request", { payload: {} });
+    await emit("after_provider_response", { status: 500, headers: {} });
+    await emit("turn_end", {
+      turnIndex: 0,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "t1", name: "bash", arguments: {} }],
+        model: "m",
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+        stopReason: "tool_use",
+      },
+    });
+    await emit("turn_start", { turnIndex: 1, timestamp: Date.now() });
+    await emit("tool_execution_start", { toolCallId: "t1", toolName: "bash", args: {} });
+    await emit("tool_execution_end", { toolCallId: "t1", toolName: "bash", result: "err", isError: true });
+    await emit("agent_end", { messages: [] });
+    await emit("session_shutdown", { reason: "quit" });
+
+    assert.ok(received.logs.length > 0, "logs exported");
+    const allLogStrings = received.logs.flatMap(stringsIn);
+    assert.ok(allLogStrings.some(s => s.includes("pi.session.start")), "pi.session.start");
+    assert.ok(allLogStrings.some(s => s.includes("pi.session.end")), "pi.session.end emitted on shutdown");
+    assert.ok(allLogStrings.some(s => s.includes("pi.llm_request.error")), "pi.llm_request.error on HTTP >=400");
+    assert.ok(allLogStrings.some(s => s.includes("pi.tool.error")), "pi.tool.error on failed tool");
+  });
 });
 
 void basename;

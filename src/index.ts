@@ -182,6 +182,20 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (event, _ctx) => {
+    const sid = sessionId();
+    const loggerProvider = runtime?.loggerProvider;
+    const selfLogs = cfg.selfLogs;
+    // Emit pi.session.end before tearing the runtime down: once shutdown runs,
+    // the logger provider is gone and the record would never flush.
+    if (selfLogs) {
+      emitLog(
+        loggerProvider,
+        "pi.session.end",
+        SeverityNumber.INFO,
+        `pi session ${sid ?? "(ephemeral)"} ended (${event.reason})`,
+        { "pi.session.reason": event.reason },
+      );
+    }
     await stop(event.reason);
   });
 
@@ -254,6 +268,17 @@ export default function (pi: ExtensionAPI): void {
       // The LLM span is opened in before_provider_request and finalized here
       // once usage/finish are known.
       tracker?.completeLlm(msg as MessageShapes.AssistantMessage);
+      const finish = (msg as MessageShapes.AssistantMessage).stopReason;
+      const errMsg = (msg as MessageShapes.AssistantMessage).errorMessage;
+      if (cfg.selfLogs && (finish === "error" || finish === "aborted")) {
+        emitLog(
+          runtime?.loggerProvider,
+          "pi.llm_request.error",
+          finish === "aborted" ? SeverityNumber.WARN : SeverityNumber.ERROR,
+          errMsg ?? `llm request ${finish}`,
+          { "gen_ai.response.finish_reasons": finish ?? "error" },
+        );
+      }
     }
     tracker?.endTurn({ reason: "end" });
   });
@@ -265,6 +290,15 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("after_provider_response", async (event, _ctx) => {
     tracker?.recordProviderResponse(event.status, event.headers ?? {});
+    if (event.status >= 400 && cfg.selfLogs) {
+      emitLog(
+        runtime?.loggerProvider,
+        "pi.llm_request.error",
+        SeverityNumber.ERROR,
+        `provider response HTTP ${event.status}`,
+        { "http.response.status_code": event.status },
+      );
+    }
   });
 
   pi.on("message_update", async (event, _ctx) => {
@@ -298,6 +332,15 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("tool_execution_end", async (event, _ctx) => {
     tracker?.endTool(event.toolCallId, event.isError, event.result);
+    if (event.isError && cfg.selfLogs) {
+      emitLog(
+        runtime?.loggerProvider,
+        "pi.tool.error",
+        SeverityNumber.ERROR,
+        `tool ${event.toolName} failed`,
+        { "gen_ai.tool.name": event.toolName, "gen_ai.tool.call.id": event.toolCallId },
+      );
+    }
   });
 
   // ----------------------------------------------------------- model changes

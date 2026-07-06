@@ -34,7 +34,7 @@ Plus a small `pi.*` set for things no semconv covers: `pi.session.duration`, `pi
 
 Token usage uses a histogram. The semconv is explicit about this. Histograms let the backend show the p50 and p95 token distribution per request, which a counter cannot.
 
-**Logs** carry `pi.*` lifecycle events: `pi.session.start`, `pi.session.end`, `pi.session.compact`, `pi.model.changed`, `pi.user_bash`, `pi.llm_request.error`, `pi.tool.error`. Each is a log record with an `event.name` attribute, a severity, and a human-readable body.
+**Logs** carry `pi.*` lifecycle events: `pi.session.start`, `pi.session.end`, `pi.session.compact`, `pi.model.changed`, `pi.user_bash`, `pi.input`, `pi.llm_request.error`, `pi.tool.error`. Each is a log record with an `event.name` attribute, a severity, and a human-readable body.
 
 ## Capabilities
 
