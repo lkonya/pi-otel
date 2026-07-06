@@ -444,8 +444,9 @@ export class SpanTracker {
     if (!this.llm || this.pendingInput.length === 0) return;
     for (const m of this.pendingInput) {
       if (m.role === "user") {
+        if (!shouldCapturePrompt()) continue;
         const attrs: Record<string, unknown> = { role: "user", ...this.llmEventGenAiSystem() };
-        if (shouldCapturePrompt()) attrs.content = clampAttr(m.text);
+        attrs.content = clampAttr(m.text);
         this.llm.span.addEvent(EVENT_GEN_AI_USER_MESSAGE, attrs as Attributes);
         this.llm.inputMessages.push({ role: "user", parts: [{ type: "text", content: m.text }] });
       } else if (shouldCaptureToolContent()) {

@@ -19,6 +19,8 @@ import {
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
   ATTR_GEN_AI_TOOL_CALL_RESULT,
   ATTR_GEN_AI_OPERATION_NAME,
+  ATTR_GEN_AI_INPUT_MESSAGES,
+  ATTR_GEN_AI_OUTPUT_MESSAGES,
   ATTR_HTTP_STATUS_CODE,
   ATTR_PI_SESSION_ID,
   ATTR_PI_SESSION_REASON,
@@ -553,6 +555,45 @@ describe("content capture modes", () => {
     assert.ok("pi.user_prompt.bytes" in attrs, "fingerprint bytes present");
   });
 
+  test("metadata_only emits no raw text on LLM span attributes or events", async () => {
+    // The interaction prompt is fingerprinted, but the LLM span has its own
+    // surfaces for input/output text: the gen_ai.*.message events and the
+    // gen_ai.input.messages / gen_ai.output.messages JSON attributes. All of
+    // these must omit raw text in metadata_only mode; otherwise the promise
+    // of "no raw payloads leaving the machine" is broken on the LLM span.
+    const h2 = makeHarness({ captureContent: "metadata_only" });
+    h2.tracker.startSession();
+    h2.tracker.startInteraction("the-prompt-secret");
+    h2.tracker.startTurn(0);
+    h2.tracker.startLlm("m", "anthropic");
+    h2.tracker.noteUserInput("the-prompt-secret");
+    h2.tracker.noteToolResultInput("call_1", "bash", "the-tool-output-secret");
+    h2.tracker.completeLlm(asstMsg({ text: "the-completion-secret" }) as never);
+    h2.tracker.endTurn();
+    h2.tracker.endInteraction();
+    h2.tracker.endSession();
+    await h2.flush();
+    const llm = h2.spansByName()[SPAN_LLM_REQUEST];
+    assert.ok(llm, "llm span present");
+    // No JSON message attributes carrying raw content.
+    assert.equal(ATTR_GEN_AI_INPUT_MESSAGES in llm.attributes, false, "no raw gen_ai.input.messages");
+    assert.equal(ATTR_GEN_AI_OUTPUT_MESSAGES in llm.attributes, false, "no raw gen_ai.output.messages");
+    // No message events carrying raw content.
+    const eventNames = new Set(llm.events.map(e => e.name));
+    assert.equal(eventNames.has("gen_ai.user.message"), false, "no gen_ai.user.message event");
+    assert.equal(eventNames.has("gen_ai.tool.message"), false, "no gen_ai.tool.message event");
+    assert.equal(eventNames.has("gen_ai.assistant.message"), false, "no gen_ai.assistant.message event");
+    assert.equal(eventNames.has("gen_ai.choice"), false, "no gen_ai.choice event");
+    // Nothing on the span (attributes or events) contains the secrets.
+    const secrets = ["the-prompt-secret", "the-tool-output-secret", "the-completion-secret"];
+    const attrBlob = JSON.stringify(llm.attributes);
+    const eventBlob = JSON.stringify(llm.events);
+    for (const s of secrets) {
+      assert.ok(!attrBlob.includes(s), `no raw secret ${s} in llm attributes`);
+      assert.ok(!eventBlob.includes(s), `no raw secret ${s} in llm events`);
+    }
+  });
+
   test("full emits raw user prompt", async () => {
     const h2 = makeHarness({ captureContent: "full" });
     h2.tracker.startSession();
@@ -580,6 +621,40 @@ describe("content capture modes", () => {
     // tool args/result NOT captured
     assert.equal(ATTR_GEN_AI_TOOL_CALL_ARGUMENTS in spans["pi.tool.bash"].attributes, false);
     assert.equal(ATTR_GEN_AI_TOOL_CALL_RESULT in spans["pi.tool.bash"].attributes, false);
+  });
+
+  test("no_tool_content emits raw prompt/completion on LLM span but no tool args", async () => {
+    // no_tool_content captures prompt and completion text, but never tool
+    // arguments or results. The LLM span's gen_ai.*.message events and the
+    // gen_ai.input/output.messages JSON attributes carry the prompt and the
+    // assistant text raw; tool-call arguments embedded in the assistant
+    // message must be omitted.
+    const h2 = makeHarness({ captureContent: "no_tool_content" });
+    h2.tracker.startSession();
+    h2.tracker.startInteraction("the-prompt");
+    h2.tracker.startTurn(0);
+    h2.tracker.startLlm("m", "anthropic");
+    h2.tracker.noteUserInput("the-prompt");
+    h2.tracker.noteToolResultInput("call_1", "bash", "the-tool-output-secret");
+    h2.tracker.completeLlm(asstMsg({
+      text: "the-completion",
+      toolCalls: [{ id: "call_1", name: "bash", arguments: { command: "secret-cmd" } }],
+    }) as never);
+    h2.tracker.endTurn(); h2.tracker.endInteraction(); h2.tracker.endSession();
+    await h2.flush();
+    const llm = h2.spansByName()[SPAN_LLM_REQUEST];
+    // Prompt and completion are captured raw.
+    const attrBlob = JSON.stringify(llm.attributes);
+    const eventBlob = JSON.stringify(llm.events);
+    assert.ok(attrBlob.includes("the-prompt") || eventBlob.includes("the-prompt"), "raw prompt captured");
+    assert.ok(attrBlob.includes("the-completion") || eventBlob.includes("the-completion"), "raw completion captured");
+    // Tool arguments and results are never captured.
+    assert.ok(!attrBlob.includes("secret-cmd"), "no tool arg secret in llm attributes");
+    assert.ok(!eventBlob.includes("secret-cmd"), "no tool arg secret in llm events");
+    assert.ok(!attrBlob.includes("the-tool-output-secret"), "no tool result secret in llm attributes");
+    assert.ok(!eventBlob.includes("the-tool-output-secret"), "no tool result secret in llm events");
+    // The tool.message event (which carries tool result text) is not emitted.
+    assert.equal(llm.events.some(e => e.name === "gen_ai.tool.message"), false, "no gen_ai.tool.message event");
   });
 
   test("full captures tool args and result", async () => {
