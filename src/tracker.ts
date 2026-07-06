@@ -60,6 +60,8 @@ import {
   ATTR_GEN_AI_TOOL_CALL_RESULT,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_HTTP_STATUS_CODE,
+  ATTR_ERROR_TYPE,
+  ATTR_EXCEPTION_MESSAGE,
   ATTR_PI_CANCELLED,
   ATTR_PI_CWD,
   ATTR_PI_ERROR_COUNT,
@@ -159,6 +161,7 @@ export class SpanTracker {
     toolCallCount?: number;
     inputTokens?: number;
     outputTokens?: number;
+    reasoningTokens?: number;
     httpStatus?: number;
     attempts: number;
     inputMessages: Array<Record<string, unknown>>;
@@ -488,7 +491,7 @@ export class SpanTracker {
     }
     if (status >= 400) {
       this.errorCount++;
-      this.llm.span.setAttribute("error.type", categorizeHttpError(status));
+      this.llm.span.setAttribute(ATTR_ERROR_TYPE, categorizeHttpError(status));
       this.llm.span.setStatus({ code: SpanStatusCode.ERROR, message: `HTTP ${status}` });
     }
     return retry;
@@ -513,7 +516,7 @@ export class SpanTracker {
     if (finish === "error" || finish === "aborted") {
       llm.span.setAttribute(ATTR_PI_CANCELLED, finish === "aborted");
       if (message.errorMessage) {
-        llm.span.setAttribute("exception.message", message.errorMessage);
+        llm.span.setAttribute(ATTR_EXCEPTION_MESSAGE, message.errorMessage);
       }
       llm.span.setStatus({
         code: SpanStatusCode.ERROR,
@@ -545,6 +548,7 @@ export class SpanTracker {
     set(ATTR_GEN_AI_OUTPUT_TOKENS, u.output);
     set(ATTR_GEN_AI_CACHE_READ_TOKENS, u.cacheRead);
     set(ATTR_GEN_AI_CACHE_WRITE_TOKENS, u.cacheWrite);
+    set(ATTR_GEN_AI_REASONING_TOKENS, u.reasoning);
     if (typeof u.cacheWrite1h === "number") {
       set(ATTR_GEN_AI_CACHE_WRITE_1H_TOKENS, u.cacheWrite1h);
     }
@@ -553,6 +557,7 @@ export class SpanTracker {
     }
     this.llm.inputTokens = u.input;
     this.llm.outputTokens = u.output;
+    this.llm.reasoningTokens = u.reasoning;
   }
 
   private recordLlmMetrics(): void {
@@ -570,6 +575,9 @@ export class SpanTracker {
       }
       if (typeof this.llm.outputTokens === "number") {
         m.tokenUsage.record(this.llm.outputTokens, { ...base, [ATTR_GEN_AI_TOKEN_TYPE]: "output" });
+      }
+      if (typeof this.llm.reasoningTokens === "number") {
+        m.tokenUsage.record(this.llm.reasoningTokens, { ...base, [ATTR_GEN_AI_TOKEN_TYPE]: "reasoning" });
       }
     } catch { /* best-effort */ }
   }
@@ -641,14 +649,14 @@ export class SpanTracker {
     const elapsedMs = Number(process.hrtime.bigint() - slot.startNs) / 1e6;
     slot.span.setAttribute("pi.tool.duration_ms", elapsedMs);
     if (isError) {
-      slot.span.setAttribute("error.type", "tool_error");
+      slot.span.setAttribute(ATTR_ERROR_TYPE, "tool_error");
       slot.span.setStatus({ code: SpanStatusCode.ERROR, message: "tool execution failed" });
     }
     slot.span.end();
     try {
       const attrs: Attributes = this.commonAttrs();
       attrs[ATTR_GEN_AI_TOOL_NAME] = slot.name;
-      if (isError) attrs["error.type"] = "tool_error";
+      if (isError) attrs[ATTR_ERROR_TYPE] = "tool_error";
       this.opts.metrics()?.toolCalls.add(1, attrs);
     } catch { /* noop */ }
   }
@@ -688,8 +696,8 @@ export class SpanTracker {
     const errName = error instanceof Error ? error.name : "Error";
     const errMsg = error instanceof Error ? error.message : String(error);
     const combined = `${errName} ${errMsg}`;
-    span.setAttribute("error.type", categorizeThrownError(combined, errName));
-    span.setAttribute("exception.message", errMsg);
+    span.setAttribute(ATTR_ERROR_TYPE, categorizeThrownError(combined, errName));
+    span.setAttribute(ATTR_EXCEPTION_MESSAGE, errMsg);
     span.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
     // The end* methods pass the same error down the LLM -> turn -> interaction
     // cascade, so a single logical error reaches here up to three times.
@@ -806,14 +814,6 @@ export type { MessageShapes };
 // Keeping them structural also lets us tolerate minor field additions across
 // pi versions without a type error.
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Structural message shapes.
-// These mirror @earendil-works/pi-ai's AssistantMessage / ToolCall / Usage.
-// We declare them locally rather than importing from pi-ai (a transitive dep
-// of pi-coding-agent that may not resolve from an extension's node_modules).
-// Keeping them structural also lets us tolerate minor field additions across
-// pi versions without a type error.
-// ---------------------------------------------------------------------------
 namespace MessageShapes {
   export interface Usage {
     input: number;
@@ -821,6 +821,8 @@ namespace MessageShapes {
     cacheRead: number;
     cacheWrite: number;
     cacheWrite1h?: number;
+    /** Reasoning/thinking tokens reported by some providers (e.g. OpenAI o-series). */
+    reasoning?: number;
     totalTokens?: number;
     cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
   }

@@ -7,6 +7,7 @@ import {
   ATTR_GEN_AI_CACHE_READ_TOKENS,
   ATTR_GEN_AI_CACHE_WRITE_TOKENS,
   ATTR_GEN_AI_CACHE_WRITE_1H_TOKENS,
+  ATTR_GEN_AI_REASONING_TOKENS,
   ATTR_GEN_AI_COST_USD,
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_RESPONSE_MODEL,
@@ -226,6 +227,30 @@ describe("llm usage attribution", () => {
     const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
     assert.equal(ATTR_GEN_AI_CACHE_WRITE_1H_TOKENS in a, false, "must not set 1h attr when undefined");
     assert.equal(a[ATTR_GEN_AI_CACHE_WRITE_TOKENS], 10);
+  });
+
+  test("records reasoning tokens when reported", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("o-series", "openai");
+    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, reasoning: 42, stopReason: "stop" }) as never);
+    h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
+    await h.flush();
+    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    assert.equal(a[ATTR_GEN_AI_REASONING_TOKENS], 42, "reasoning tokens captured");
+  });
+
+  test("omits reasoning tokens attribute when not reported", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, stopReason: "stop" }) as never);
+    h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
+    await h.flush();
+    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    assert.equal(ATTR_GEN_AI_REASONING_TOKENS in a, false, "must not set reasoning attr when undefined");
   });
 
   test("records request and response model", async () => {

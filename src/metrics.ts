@@ -9,6 +9,17 @@
 
 import { type Counter, type Histogram, type MeterProvider } from "@opentelemetry/api";
 import { extensionVersion } from "./version.js";
+import {
+  METRIC_OP_DURATION,
+  METRIC_TOKEN_USAGE,
+  METRIC_TOOL_CALLS,
+  METRIC_SESSION_DURATION,
+  METRIC_PROMPT_COUNT,
+  METRIC_TURN_COUNT,
+  METRIC_PROVIDER_RETRIES,
+  METRIC_TURN_CANCELLATIONS,
+  METRIC_COMPACTION_COUNT,
+} from "./attrs.js";
 
 const METER_NAME = "pi-otel";
 const METER_VERSION = extensionVersion();
@@ -47,7 +58,7 @@ export function getMetrics(provider: MeterProvider | null | undefined): Metrics 
   const meter = provider.getMeter(METER_NAME, METER_VERSION);
   // The no-op meter (no provider) returns functional no-op instruments.
   cached = {
-    opDuration: meter.createHistogram("gen_ai.client.operation.duration", {
+    opDuration: meter.createHistogram(METRIC_OP_DURATION, {
       description: "Duration of GenAI client operations",
       unit: "s",
     }),
@@ -59,35 +70,35 @@ export function getMetrics(provider: MeterProvider | null | undefined): Metrics 
       description: "Duration of GenAI client operations from request start to completion",
       unit: "s",
     }),
-    tokenUsage: meter.createHistogram("gen_ai.client.token.usage", {
+    tokenUsage: meter.createHistogram(METRIC_TOKEN_USAGE, {
       description: "Number of tokens used in GenAI client operations",
       unit: "{token}",
     }),
-    toolCalls: meter.createCounter("gen_ai.client.tool.calls", {
+    toolCalls: meter.createCounter(METRIC_TOOL_CALLS, {
       description: "Total number of tool calls invoked by the agent",
       unit: "{call}",
     }),
-    sessionDuration: meter.createHistogram("pi.session.duration", {
+    sessionDuration: meter.createHistogram(METRIC_SESSION_DURATION, {
       description: "Duration of a pi session",
       unit: "s",
     }),
-    promptCount: meter.createCounter("pi.prompt.count", {
+    promptCount: meter.createCounter(METRIC_PROMPT_COUNT, {
       description: "User prompts (agent interactions)",
       unit: "{prompt}",
     }),
-    turnCount: meter.createCounter("pi.turn.count", {
+    turnCount: meter.createCounter(METRIC_TURN_COUNT, {
       description: "LLM turns",
       unit: "{turn}",
     }),
-    providerRetries: meter.createCounter("pi.provider.retries", {
+    providerRetries: meter.createCounter(METRIC_PROVIDER_RETRIES, {
       description: "Provider HTTP attempts after the first within a single LLM request",
       unit: "{retry}",
     }),
-    turnCancellations: meter.createCounter("pi.turn.cancellations", {
+    turnCancellations: meter.createCounter(METRIC_TURN_CANCELLATIONS, {
       description: "Agent turns cancelled via abort signal",
       unit: "{turn}",
     }),
-    compactionCount: meter.createCounter("pi.compaction.count", {
+    compactionCount: meter.createCounter(METRIC_COMPACTION_COUNT, {
       description: "Context compaction events",
       unit: "{event}",
     }),

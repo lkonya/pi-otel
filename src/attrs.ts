@@ -64,8 +64,6 @@ export const EVENT_GEN_AI_COMPLETION = "gen_ai.completion";
 
 export const ATTR_ERROR_TYPE = "error.type";
 export const ATTR_EXCEPTION_MESSAGE = "exception.message";
-export const ATTR_EXCEPTION_TYPE = "exception.type";
-export const ATTR_EXCEPTION_STACKTRACE = "exception.stacktrace";
 export const ATTR_HTTP_STATUS_CODE = "http.response.status_code";
 
 // ---------------------------------------------------------------------------

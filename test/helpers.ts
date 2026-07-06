@@ -135,6 +135,7 @@ export function asstMsg(opts: {
   cacheRead?: number;
   cacheWrite?: number;
   cacheWrite1h?: number;
+  reasoning?: number;
   cost?: number;
   stopReason?: string;
   responseModel?: string;
@@ -158,6 +159,7 @@ export function asstMsg(opts: {
       cacheRead: opts.cacheRead ?? 0,
       cacheWrite: opts.cacheWrite ?? 0,
       cacheWrite1h: opts.cacheWrite1h,
+      reasoning: opts.reasoning,
       cost: { total: opts.cost },
     },
     stopReason: opts.stopReason ?? "stop",
