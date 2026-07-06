@@ -308,3 +308,33 @@ describe("detectHostId", () => {
     assert.equal(detectHostId(), require("node:os").hostname());
   });
 });
+
+describe("signal handler lifecycle", () => {
+  test("shutdown removes the SIGTERM/SIGHUP handlers", async () => {
+    const before = process.listenerCount("SIGTERM") + process.listenerCount("SIGHUP");
+    const rt = await startRuntime(cfg());
+    assert.equal(process.listenerCount("SIGTERM"), before + 1, "SIGTERM handler registered");
+    assert.equal(process.listenerCount("SIGHUP"), before + 1, "SIGHUP handler registered");
+    await rt.shutdown();
+    assert.equal(process.listenerCount("SIGTERM"), before, "SIGTERM handler removed on shutdown");
+    assert.equal(process.listenerCount("SIGHUP"), before, "SIGHUP handler removed on shutdown");
+  });
+
+  test("removeProcessHooks detaches without shutting down", async () => {
+    const before = process.listenerCount("SIGTERM") + process.listenerCount("SIGHUP");
+    const rt = await startRuntime(cfg());
+    rt.removeProcessHooks();
+    assert.equal(process.listenerCount("SIGTERM"), before, "SIGTERM handler detached");
+    assert.equal(process.listenerCount("SIGHUP"), before, "SIGHUP handler detached");
+    // flush still works after detaching (the runtime is not shut down).
+    await rt.flush();
+    await rt.shutdown();
+  });
+
+  test("repeated removeProcessHooks is a safe no-op", async () => {
+    const rt = await startRuntime(cfg());
+    rt.removeProcessHooks();
+    rt.removeProcessHooks(); // must not throw
+    await rt.shutdown();
+  });
+});

@@ -145,6 +145,11 @@ export default function (pi: ExtensionAPI): void {
     } catch { /* best-effort */ }
     tracker = null;
     if (runtime) {
+      // Detach this runtime's signal handlers whether we shut down or only
+      // flush. Reload rebuilds the runtime on the next session_start and
+      // registers a fresh pair; leaving the old pair attached would stack a
+      // new set of SIGTERM/SIGHUP listeners on process every reload.
+      runtime.removeProcessHooks();
       // reload should flush (keep SDK for the next factory's spans); quit shuts down.
       if (reason === "quit") {
         await runtime.shutdown();

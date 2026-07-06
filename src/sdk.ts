@@ -90,6 +90,8 @@ export interface TelemetryRuntime {
   flush: () => Promise<void>;
   /** Shut down all active providers and release resources. Idempotent. */
   shutdown: () => Promise<void>;
+  /** Detach the SIGTERM/SIGHUP handlers registered for this runtime. */
+  removeProcessHooks: () => void;
 }
 
 export interface ExporterOpts {
@@ -357,6 +359,24 @@ export async function startRuntime(
   const tracer = traceProvider?.getTracer(TRACER_NAME, TRACER_VERSION) ?? noopTracer();
 
   let shutdownStarted = false;
+
+  // Crash insurance: pi fires session_shutdown on normal exit, but SIGTERM
+  // (container stop, IDE shutdown) and SIGHUP (closed terminal) can skip it.
+  // Register on those signals to flush+shutdown best-effort. We deliberately
+  // do NOT register on 'exit' or 'beforeExit': 'beforeExit' re-arms the event
+  // loop when its async work schedules, looping indefinitely; 'exit' runs
+  // synchronously and cannot await the flush, so it just adds noise.
+  // removeProcessHooks is exposed on the runtime so callers can detach the
+  // previous session's handlers when the runtime is replaced (reload) without
+  // a full shutdown; otherwise each reload stacks a fresh pair of listeners.
+  const onSignal = () => { void shutdown(); };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGHUP", onSignal);
+  const removeProcessHooks = (): void => {
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGHUP", onSignal);
+  };
+
   const flush = async (): Promise<void> => {
     if (shutdownStarted) return;
     await Promise.allSettled([
@@ -377,21 +397,7 @@ export async function startRuntime(
     await shutdownProviders(traceProvider, meterProvider, loggerProvider, cfg.shutdownTimeoutMs, health);
   };
 
-  // Crash insurance: pi fires session_shutdown on normal exit, but SIGTERM
-  // (container stop, IDE shutdown) and SIGHUP (closed terminal) can skip it.
-  // Register on those signals to flush+shutdown best-effort. We deliberately
-  // do NOT register on 'exit' or 'beforeExit': 'beforeExit' re-arms the event
-  // loop when its async work schedules, looping indefinitely; 'exit' runs
-  // synchronously and cannot await the flush, so it just adds noise.
-  const onSignal = () => { void shutdown(); };
-  process.on("SIGTERM", onSignal);
-  process.on("SIGHUP", onSignal);
-  const removeProcessHooks = (): void => {
-    process.removeListener("SIGTERM", onSignal);
-    process.removeListener("SIGHUP", onSignal);
-  };
-
-  return { config: cfg, tracer, traceProvider, meterProvider, loggerProvider, health, flush, shutdown };
+  return { config: cfg, tracer, traceProvider, meterProvider, loggerProvider, health, flush, shutdown, removeProcessHooks };
 }
 
 /** Minimal provider surface that shutdown needs: forceFlush + shutdown. */
