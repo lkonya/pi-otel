@@ -782,6 +782,38 @@ describe("session summary attributes", () => {
     assert.equal(ATTR_GEN_AI_COST_USD in a, false);
     assert.equal(ATTR_PI_ERROR_COUNT in a, false);
   });
+
+  test("a turn-level error passed through endInteraction counts once", async () => {
+    // endInteraction propagates its error down the LLM -> turn -> interaction
+    // cascade, calling setStatusFromError three times with the same reference.
+    // pi.error_count must reflect one session error, not three.
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    const err = new Error("boom");
+    h.tracker.endInteraction({ reason: "end", error: err });
+    h.tracker.endSession();
+    await h.flush();
+    const a = h.spansByName()[SPAN_SESSION].attributes;
+    assert.equal(a[ATTR_PI_ERROR_COUNT], 1, "cascade counts the error once");
+  });
+
+  test("distinct errors each count toward pi.error_count", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.endInteraction({ reason: "end", error: new Error("first") });
+    h.tracker.startInteraction("p2");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.endInteraction({ reason: "end", error: new Error("second") });
+    h.tracker.endSession();
+    await h.flush();
+    const a = h.spansByName()[SPAN_SESSION].attributes;
+    assert.equal(a[ATTR_PI_ERROR_COUNT], 2);
+  });
 });
 
 describe("time to completion", () => {

@@ -179,6 +179,8 @@ export class SpanTracker {
   private totalOutputTokens = 0;
   private totalCostUsd = 0;
   private errorCount = 0;
+  /** Last error reference counted toward errorCount, for cascade dedupe. */
+  private lastCountedError: unknown = undefined;
 
   constructor(opts: TrackerOptions) {
     this.opts = opts;
@@ -689,7 +691,14 @@ export class SpanTracker {
     span.setAttribute("error.type", categorizeThrownError(combined, errName));
     span.setAttribute("exception.message", errMsg);
     span.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
-    if (this.llm && span === this.llm.span) this.errorCount++;
+    // The end* methods pass the same error down the LLM -> turn -> interaction
+    // cascade, so a single logical error reaches here up to three times.
+    // Count each distinct error once toward the session's pi.error_count by
+    // remembering the last reference we incremented on.
+    if (this.lastCountedError !== error) {
+      this.errorCount++;
+      this.lastCountedError = error;
+    }
   }
 
   /**
