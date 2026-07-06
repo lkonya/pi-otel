@@ -625,7 +625,14 @@ export class SpanTracker {
     }
     const spanOptions: { attributes: Attributes; links?: Array<{ context: SpanContext }> } = { attributes: attrs };
     if (this.llm) {
-      spanOptions.links = [{ context: this.llm.span.spanContext() }];
+      // Only link when the LLM span has a real span context. When traces are
+      // disabled the runtime hands the tracker a no-op tracer whose span
+      // contexts carry empty trace/span ids; a link to such a context is
+      // invalid per the OTel spec, so skip it.
+      const ctx = this.llm.span.spanContext();
+      if (ctx.traceId && ctx.spanId) {
+        spanOptions.links = [{ context: ctx }];
+      }
     }
     const span = this.opts.tracer.startSpan(spanToolName(toolName), spanOptions, parent);
     this.tools.set(toolCallId, {
