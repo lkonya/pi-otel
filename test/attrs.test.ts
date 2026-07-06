@@ -70,6 +70,30 @@ describe("clampAttr", () => {
     assert.ok(!decoded.includes("\uFFFD"), "no U+FFFD replacement chars from split multibyte");
   });
 
+  test("truncation lands on a UTF-8 character boundary for 4-byte chars", () => {
+    // The truncation point is computed in byte space against the UTF-8 buffer,
+    // so it must never cut in the middle of a multi-byte sequence. 𝄞 (U+1D11E)
+    // is a 4-byte UTF-8 char encoded as a surrogate pair in JS. An earlier
+    // implementation walked back using UTF-16 charCodeAt against UTF-8 byte
+    // masks, which never matched for code points above U+00FF and could leave
+    // the cut mid-character. Repeat across many offsets to cover the boundary.
+    const ch = "𝄞"; // 4 bytes in UTF-8, 2 UTF-16 code units
+    const chBytes = Buffer.byteLength(ch, "utf8");
+    assert.equal(chBytes, 4);
+    // Fill so the limit falls inside a run of 4-byte chars at various offsets.
+    for (const offset of [0, 1, 2, 3, 4, 5]) {
+      const fill = "a".repeat(64 * 1024 - offset);
+      const big = fill + ch.repeat(1000);
+      const out = clampAttr(big);
+      const buf = Buffer.from(out, "utf8");
+      assert.ok(buf.length <= 64 * 1024, `fits under 64 KiB at offset ${offset}`);
+      // No U+FFFD when decoded means no sequence was split.
+      const decoded = buf.toString("utf8");
+      assert.ok(!decoded.includes("\uFFFD"), `no replacement char at offset ${offset}`);
+      assert.ok(out.endsWith("…[truncated]"), `marker present at offset ${offset}`);
+    }
+  });
+
   test("handles circular references without throwing", () => {
     const a: Record<string, unknown> = {};
     a.self = a;

@@ -139,8 +139,9 @@ const TRUNC_SUFFIX = "…[truncated]";
 
 /**
  * Clamp a value to a byte-safe string attribute. Objects are JSON-serialized
- * with a circular-reference guard. Byte-safe truncation never splits a UTF-8
- * multi-byte sequence.
+ * with a circular-reference guard. Truncation works in UTF-8 byte space so
+ * it never splits a multi-byte sequence and never trusts UTF-16 code-unit
+ * indices as byte offsets.
  */
 export function clampAttr(value: unknown): string {
   let s: string;
@@ -153,14 +154,13 @@ export function clampAttr(value: unknown): string {
   }
   const bytes = Buffer.byteLength(s, "utf8");
   if (bytes <= MAX_ATTR_BYTES) return s;
-  // Shrink until the truncated form fits, leaving room for the suffix.
+  // Work in byte space. Leave room for the truncation suffix, then shrink to
+  // the largest byte offset at or below the budget that lands on a UTF-8
+  // character boundary (a byte that is not a continuation byte, 0x80-0xBF).
+  const buf = Buffer.from(s, "utf8");
   let end = MAX_ATTR_BYTES - Buffer.byteLength(TRUNC_SUFFIX, "utf8");
-  while (end > 0 && Buffer.byteLength(s.slice(0, end), "utf8") > end) {
-    end -= 64;
-  }
-  // Walk back to a UTF-8 boundary (avoid splitting a multi-byte char).
-  while (end > 0 && (s.charCodeAt(end) & 0xc0) === 0xc0) end--; // leading byte
-  return `${s.slice(0, end)}${TRUNC_SUFFIX}`;
+  while (end > 0 && ((buf[end] ?? 0) & 0xc0) === 0x80) end--; // back over continuations
+  return `${buf.subarray(0, end).toString("utf8")}${TRUNC_SUFFIX}`;
 }
 
 const SAFE_STRINGIFY_REPLACER = (_k: string, v: unknown): unknown => {
