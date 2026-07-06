@@ -35,7 +35,47 @@ import { emitLog } from "./logging.js";
 import { getMetrics, resetMetrics } from "./metrics.js";
 import { resetLogger } from "./logging.js";
 import { type TelemetryRuntime, startRuntime } from "./sdk.js";
+import { clampAttr } from "./attrs.js";
 import { configureCapture, extractMessageText, SpanTracker, type SessionReason } from "./tracker.js";
+
+/** Normalized shape of a pi-otel:log payload from another extension. */
+interface LogChannelPayload {
+  eventName: string;
+  severity: string;
+  body: string;
+  attributes: Record<string, string | number | boolean>;
+}
+
+const ALLOWED_SEVERITIES = new Set(["trace", "debug", "info", "warn", "warning", "error", "fatal"]);
+
+/**
+ * Validate and normalize a pi-otel:log payload from an untrusted extension.
+ * Returns null when the payload is not usable. Primitive attribute values are
+ * kept; nested objects and arrays are dropped (the OTLP log model only
+ * accepts scalar attribute values). Strings are clamped to the attribute
+ * ceiling so a misbehaving extension cannot push oversized records.
+ */
+export function normalizeLogPayload(data: unknown): LogChannelPayload | null {
+  if (!data || typeof data !== "object") return null;
+  const d = data as Record<string, unknown>;
+  const eventName = typeof d.eventName === "string" ? d.eventName : null;
+  if (!eventName) return null;
+  const severity =
+    typeof d.severity === "string" && ALLOWED_SEVERITIES.has(d.severity.toLowerCase())
+      ? d.severity.toLowerCase()
+      : "info";
+  const body = typeof d.body === "string" ? clampAttr(d.body) : "";
+  const rawAttrs = (d.attributes ?? null) as unknown;
+  const attributes: Record<string, string | number | boolean> = {};
+  if (rawAttrs && typeof rawAttrs === "object" && !Array.isArray(rawAttrs)) {
+    for (const [k, v] of Object.entries(rawAttrs as Record<string, unknown>)) {
+      if (typeof v === "string") attributes[k] = clampAttr(v);
+      else if (typeof v === "number" || typeof v === "boolean") attributes[k] = v;
+      // objects, arrays, null, undefined, etc. are dropped
+    }
+  }
+  return { eventName, severity, body, attributes };
+}
 
 export default function (pi: ExtensionAPI): void {
   // Commands are registered up front so /otel-status works even before
@@ -49,21 +89,17 @@ export default function (pi: ExtensionAPI): void {
   registerCommands(pi, () => runtime);
 
   // pi-otel:log — cross-extension log channel. Best-effort; no-op when logs
-  // are disabled or the runtime isn't up yet.
+  // are disabled or the runtime isn't up yet. Payloads are untrusted and get
+  // validated before they reach the OTLP logger.
   pi.events.on("pi-otel:log", (data: unknown) => {
-    if (!data || typeof data !== "object") return;
-    const d = data as {
-      eventName?: string;
-      severity?: string;
-      body?: string;
-      attributes?: Record<string, string | number | boolean>;
-    };
+    const payload = normalizeLogPayload(data);
+    if (!payload) return;
     emitLog(
       runtime?.loggerProvider,
-      d.eventName ?? "pi-otel.log",
-      d.severity ?? "info",
-      d.body ?? "",
-      d.attributes ?? {},
+      payload.eventName,
+      payload.severity,
+      payload.body,
+      payload.attributes,
     );
   });
 
