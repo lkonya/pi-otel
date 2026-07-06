@@ -214,6 +214,6 @@ export function fingerprint(value: unknown): Record<string, number | string> {
   return {
     bytes,
     lines,
-    sha256_short: (h >>> 0).toString(16).padStart(8, "0"),
+    hash_short: (h >>> 0).toString(16).padStart(8, "0"),
   };
 }

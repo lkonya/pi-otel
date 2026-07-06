@@ -101,7 +101,7 @@ describe("fingerprint", () => {
     const fp = fingerprint("hello\nworld");
     assert.equal(fp.bytes, 11);
     assert.equal(fp.lines, 2);
-    assert.match(String(fp.sha256_short), /^[0-9a-f]{8}$/);
+    assert.match(String(fp.hash_short), /^[0-9a-f]{8}$/);
   });
 
   test("empty string -> 0 bytes, 0 lines", () => {
