@@ -115,12 +115,13 @@ interface Slot {
   ctx: Context;
 }
 interface TimedSlot extends Slot {
+  /** Monotonic nanoseconds (process.hrtime.bigint) for accurate sub-ms durations. */
   startNs: bigint;
+  /** Wall-clock ms (injectable now()) for orphan-sweep age checks. */
+  startMs: number;
 }
 interface ToolSlot extends TimedSlot {
   name: string;
-  /** Wall-clock ms when the tool span opened (uses injectable `now()` for orphan sweep). */
-  startMs: number;
 }
 
 const OP_NAME_CHAT = "chat";
@@ -269,13 +270,13 @@ export class SpanTracker {
       }
     }
     // LLM span.
-    if (this.llm && Number(this.llm.startNs) / 1e6 < cutoff) {
+    if (this.llm && this.llm.startMs < cutoff) {
       this.llm.span.setAttribute(ATTR_PI_ORPHANED, true);
       this.llm.span.end();
       this.llm = null;
     }
     // Turn span.
-    if (this.turn && Number(this.turn.startNs) / 1e6 < cutoff) {
+    if (this.turn && this.turn.startMs < cutoff) {
       this.turn.span.setAttribute(ATTR_PI_ORPHANED, true);
       this.turn.span.end();
       this.turn = null;
@@ -345,7 +346,7 @@ export class SpanTracker {
     attrs[ATTR_PI_TURN_INDEX] = turnIndex;
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
     const span = this.opts.tracer.startSpan(SPAN_TURN, { attributes: attrs }, this.interaction.ctx);
-    this.turn = { span, ctx: trace.setSpan(this.interaction.ctx, span), index: turnIndex, startNs: process.hrtime.bigint() };
+    this.turn = { span, ctx: trace.setSpan(this.interaction.ctx, span), index: turnIndex, startNs: process.hrtime.bigint(), startMs: this.now() };
     try { this.opts.metrics()?.turnCount.add(1, this.commonAttrs()); } catch { /* noop */ }
   }
 
@@ -382,6 +383,7 @@ export class SpanTracker {
       span,
       ctx: trace.setSpan(parent, span),
       startNs: process.hrtime.bigint(),
+      startMs: this.now(),
       requestModel,
       providerSystem,
       attempts: 0,

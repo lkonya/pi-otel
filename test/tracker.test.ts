@@ -850,7 +850,13 @@ describe("orphan sweep", () => {
   // it with a controllable fake clock and a manual timer so the test is instant
   // and deterministic.
   function makeSweepHarness(ttlMs: number) {
-    let now = 1_000_000;
+    // Start the fake clock high enough that it exceeds the monotonic hrtime
+    // epoch in ms. The orphan sweep compares span start times (stamped from
+    // this clock) against its cutoff; an earlier implementation compared
+    // hrtime-derived ms against this wall-clock value, and a small fake clock
+    // hid the bug because hrtime-ms was larger than the cutoff. A clock near
+    // Date.now()'s magnitude reproduces the real-world drift.
+    let now = 1_700_000_000_000;
     let tick: () => void = () => {};
     const exporter = new InMemorySpanExporter();
     const provider = new BasicTracerProvider({
@@ -917,5 +923,46 @@ describe("orphan sweep", () => {
     const tool = exporter.getFinishedSpans().find(s => s.name === "pi.tool.bash");
     assert.ok(tool, "tool span present (ended by endSession, not by sweep)");
     assert.notEqual(tool!.attributes[ATTR_PI_ORPHANED], true, "not orphaned: closed before TTL");
+  });
+
+  test("does not end a young LLM or turn span (wall-clock vs hrtime clock base)", async () => {
+    // The sweep must compare span age against the same clock used to stamp
+    // startMs. An earlier implementation compared hrtime-derived ms against a
+    // wall-clock cutoff; since hrtime-ms is far smaller than Date.now()-ms,
+    // every in-flight LLM/turn span looked older than the TTL and was ended
+    // on the first sweep. This fake clock starts high to expose that drift.
+    const ttl = 5_000;
+    const { tracker, exporter, tick, advance, flush } = makeSweepHarness(ttl);
+    tracker.startSession();
+    tracker.startInteraction("p");
+    tracker.startTurn(0);
+    tracker.startLlm("test-model", "test");
+    advance(1_000); // well under TTL
+    tick();
+    const live = exporter.getFinishedSpans().find(s => s.name === "pi.llm_request");
+    assert.equal(live, undefined, "young LLM span must survive the sweep");
+    tracker.endLlm({ reason: "end" });
+    tracker.endTurn({ reason: "end" });
+    tracker.endSession();
+    await flush();
+    const llm = exporter.getFinishedSpans().find(s => s.name === "pi.llm_request");
+    assert.ok(llm, "LLM span ended normally, not by the sweep");
+    assert.notEqual(llm!.attributes[ATTR_PI_ORPHANED], true, "LLM not orphaned: closed before TTL");
+  });
+
+  test("ends an LLM span left open past the TTL, marked orphaned", async () => {
+    const ttl = 5_000;
+    const { tracker, exporter, tick, advance, flush } = makeSweepHarness(ttl);
+    tracker.startSession();
+    tracker.startInteraction("p");
+    tracker.startTurn(0);
+    tracker.startLlm("test-model", "test");
+    advance(ttl + 1);
+    tick();
+    tracker.endSession();
+    await flush();
+    const llm = exporter.getFinishedSpans().find(s => s.name === "pi.llm_request");
+    assert.ok(llm, "LLM span ended by the sweep");
+    assert.equal(llm!.attributes[ATTR_PI_ORPHANED], true);
   });
 });
