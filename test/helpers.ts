@@ -7,7 +7,7 @@ import { BasicTracerProvider, BatchSpanProcessor, InMemorySpanExporter } from "@
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { SpanKind, type Tracer } from "@opentelemetry/api";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
-import { SpanTracker, configureCapture } from "../src/tracker.ts";
+import { SpanTracker } from "../src/tracker.ts";
 import type { Metrics } from "../src/metrics.ts";
 import type { ResolvedConfig } from "../src/config.ts";
 
@@ -47,6 +47,8 @@ export class RecordingMetrics {
 export function recordingMetricsOf(r: RecordingMetrics): Metrics {
   return {
     opDuration: r.histogram("op"),
+    timeToFirstToken: r.histogram("ttft"),
+    timeToCompletion: r.histogram("completion"),
     tokenUsage: r.histogram("tokens"),
     toolCalls: r.counter("toolcalls"),
     sessionDuration: r.histogram("sdur"),
@@ -55,7 +57,7 @@ export function recordingMetricsOf(r: RecordingMetrics): Metrics {
     providerRetries: r.counter("retries"),
     turnCancellations: r.counter("cancels"),
     compactionCount: r.counter("compactions"),
-  } as unknown as Metrics;
+  };
 }
 
 /** Build a config that matches the harness defaults. */
@@ -85,7 +87,6 @@ export function harnessConfig(overrides: Partial<ResolvedConfig> = {}): Resolved
 
 export function makeHarness(opts: { captureContent?: "metadata_only" | "no_tool_content" | "full" } = {}): Harness {
   const captureContent = opts.captureContent ?? "full";
-  configureCapture(captureContent);
 
   const spanExporter = new InMemorySpanExporter();
   const resource = resourceFromAttributes({ [ATTR_SERVICE_NAME]: "pi-test" });

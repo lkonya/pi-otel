@@ -32,6 +32,8 @@ import {
   ATTR_PI_ORPHANED,
   ATTR_PI_INTERACTION_ID,
   ATTR_PI_ERROR_COUNT,
+  ATTR_PI_TURN_COUNT,
+  ATTR_PI_TOOL_COUNT,
   hashPrompt,
   SPAN_SESSION,
   SPAN_INTERACTION,
@@ -40,7 +42,7 @@ import {
 } from "../src/attrs.ts";
 import { BasicTracerProvider, BatchSpanProcessor, InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import { configureCapture, SpanTracker } from "../src/tracker.ts";
+import { SpanTracker } from "../src/tracker.ts";
 import { makeHarness, asstMsg, recordingMetricsOf, RecordingMetrics, type Harness } from "./helpers.ts";
 
 /**
@@ -57,7 +59,6 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await h.flush();
-  configureCapture("full"); // restore default for other test files
 });
 
 // A canonical "happy path" interaction: one prompt, one turn, one LLM call,
@@ -345,6 +346,32 @@ describe("llm metrics", () => {
     const byType = Object.fromEntries(tokenRecs.map(r => [r.attrs["gen_ai.token.type"], r.value]));
     assert.equal(byType.input, 100);
     assert.equal(byType.output, 50);
+  });
+
+  test("records cache and reasoning token types on the usage histogram", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("claude-4", "anthropic");
+    h.tracker.completeLlm(asstMsg({
+      input: 10,
+      output: 5,
+      cacheRead: 30,
+      cacheWrite: 20,
+      cacheWrite1h: 4,
+      reasoning: 7,
+      stopReason: "stop",
+    }) as never);
+    h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
+    const byType = Object.fromEntries(
+      (h.metrics.histograms["tokens"] ?? []).map(r => [r.attrs["gen_ai.token.type"], r.value]),
+    );
+    assert.equal(byType.input, 10);
+    assert.equal(byType.output, 5);
+    assert.equal(byType.cache_read, 30);
+    assert.equal(byType.cache_write, 20);
+    assert.equal(byType.cache_write_1h, 4);
+    assert.equal(byType.reasoning, 7);
   });
 
   test("records provider retry on second response event", async () => {
@@ -798,7 +825,7 @@ describe("defensive behavior", () => {
 });
 
 describe("gen_ai.system provider", () => {
-  test("LLM span with providerSystem anthropic sets gen_ai.system", async () => {
+  test("LLM span sets gen_ai.system from provider and gen_ai.agent.name to pi", async () => {
     h.tracker.startSession();
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
@@ -808,8 +835,33 @@ describe("gen_ai.system provider", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_SYSTEM], "anthropic");
+    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    assert.equal(a[ATTR_GEN_AI_SYSTEM], "anthropic");
+    assert.equal(a["gen_ai.agent.name"], "pi");
     assert.equal(ATTR_GEN_AI_SYSTEM in h.spansByName()[SPAN_SESSION].attributes, false);
+  });
+});
+
+describe("pending input flush", () => {
+  test("user input recorded before startLlm lands on the LLM span", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    // message_start can fire before before_provider_request.
+    h.tracker.noteUserInput("queued-before-llm");
+    h.tracker.startLlm("m", "anthropic");
+    h.tracker.completeLlm(asstMsg({ text: "ok", stopReason: "stop" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    const eventBlob = JSON.stringify(llm.events);
+    const attrBlob = JSON.stringify(llm.attributes);
+    assert.ok(
+      eventBlob.includes("queued-before-llm") || attrBlob.includes("queued-before-llm"),
+      "pending user input flushed when LLM span opens",
+    );
   });
 });
 
@@ -833,6 +885,40 @@ describe("session summary attributes", () => {
     assert.equal(a[ATTR_GEN_AI_OUTPUT_TOKENS], 20);
     assert.equal(a[ATTR_GEN_AI_COST_USD], 0.03);
     assert.equal(a[ATTR_PI_ERROR_COUNT], 1);
+  });
+
+  test("session turn_count and tool_count sum across interactions", async () => {
+    h.tracker.startSession();
+    // Interaction 1: two turns, one tool.
+    h.tracker.startInteraction("a");
+    h.tracker.startTurn(0);
+    h.tracker.startTool("t1", "bash", {});
+    h.tracker.endTool("t1", false, {});
+    h.tracker.endTurn();
+    h.tracker.startTurn(1);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    // Interaction 2: one turn, two tools.
+    h.tracker.startInteraction("b");
+    h.tracker.startTurn(0);
+    h.tracker.startTool("t2", "read", {});
+    h.tracker.endTool("t2", false, {});
+    h.tracker.startTool("t3", "write", {});
+    h.tracker.endTool("t3", false, {});
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
+    await h.flush();
+    const session = h.spansByName()[SPAN_SESSION].attributes;
+    assert.equal(session[ATTR_PI_TURN_COUNT], 3, "session totals turns across interactions");
+    assert.equal(session[ATTR_PI_TOOL_COUNT], 3, "session totals tools across interactions");
+    // Per-interaction totals remain scoped to that interaction.
+    const interactions = h.spanExporter.getFinishedSpans().filter(s => s.name === SPAN_INTERACTION);
+    assert.equal(interactions.length, 2);
+    assert.equal(interactions[0].attributes[ATTR_PI_TURN_COUNT], 2);
+    assert.equal(interactions[0].attributes[ATTR_PI_TOOL_COUNT], 1);
+    assert.equal(interactions[1].attributes[ATTR_PI_TURN_COUNT], 1);
+    assert.equal(interactions[1].attributes[ATTR_PI_TOOL_COUNT], 2);
   });
 
   test("session with no LLM activity omits usage summary attrs", async () => {
@@ -880,103 +966,61 @@ describe("session summary attributes", () => {
 });
 
 describe("time to completion", () => {
-  function metricsWithCompletion(r: RecordingMetrics) {
-    const m = recordingMetricsOf(r);
-    (m as { timeToCompletion: ReturnType<RecordingMetrics["histogram"]> }).timeToCompletion = r.histogram("completion");
-    return m;
-  }
-
   test("noteLlmComplete records completion event and histogram once", async () => {
-    const spanExporter = h.spanExporter;
-    const rec = h.metrics;
-    const tracker = new SpanTracker({
-      tracer: h.tracer,
-      captureContent: "full",
-      sessionId: () => "test-session",
-      sessionFile: () => "/tmp/test.jsonl",
-      cwd: "/test",
-      metrics: () => metricsWithCompletion(rec),
-    });
-    tracker.startSession();
-    tracker.startInteraction("p");
-    tracker.startTurn(0);
-    tracker.startLlm("claude-4", "anthropic");
-    tracker.noteLlmComplete({ role: "assistant" });
-    tracker.noteLlmComplete({ role: "assistant" });
-    tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
-    tracker.endTurn();
-    tracker.endInteraction();
-    tracker.endSession();
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("claude-4", "anthropic");
+    h.tracker.noteLlmComplete({ role: "assistant" });
+    h.tracker.noteLlmComplete({ role: "assistant" });
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
     await h.flush();
-    const llm = spanExporter.getFinishedSpans().find(s => s.name === SPAN_LLM_REQUEST);
+    const llm = h.spansByName()[SPAN_LLM_REQUEST];
     assert.ok(llm);
-    const completionEvents = llm!.events.filter(e => e.name === "gen_ai.completion");
+    const completionEvents = llm.events.filter(e => e.name === "gen_ai.completion");
     assert.equal(completionEvents.length, 1);
-    assert.ok(rec.histograms["completion"]?.length === 1);
+    assert.ok(h.metrics.histograms["completion"]?.length === 1);
   });
 
   test("noteLlmComplete with user role is a no-op", async () => {
-    const spanExporter = h.spanExporter;
-    const rec = h.metrics;
-    const tracker = new SpanTracker({
-      tracer: h.tracer,
-      captureContent: "full",
-      sessionId: () => "test-session",
-      sessionFile: () => "/tmp/test.jsonl",
-      cwd: "/test",
-      metrics: () => metricsWithCompletion(rec),
-    });
-    tracker.startSession();
-    tracker.startInteraction("p");
-    tracker.startTurn(0);
-    tracker.startLlm("claude-4", "anthropic");
-    tracker.noteLlmComplete({ role: "user" });
-    tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
-    tracker.endTurn();
-    tracker.endInteraction();
-    tracker.endSession();
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("claude-4", "anthropic");
+    h.tracker.noteLlmComplete({ role: "user" });
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
     await h.flush();
-    const llm = spanExporter.getFinishedSpans().find(s => s.name === SPAN_LLM_REQUEST);
+    const llm = h.spansByName()[SPAN_LLM_REQUEST];
     assert.ok(llm);
-    assert.equal(llm!.events.filter(e => e.name === "gen_ai.completion").length, 0);
-    assert.equal(rec.histograms["completion"]?.length ?? 0, 0);
+    assert.equal(llm.events.filter(e => e.name === "gen_ai.completion").length, 0);
+    assert.equal(h.metrics.histograms["completion"]?.length ?? 0, 0);
   });
 });
 
 describe("time to first token", () => {
-  function metricsWithTtft(r: RecordingMetrics) {
-    const m = recordingMetricsOf(r);
-    (m as { timeToFirstToken: ReturnType<RecordingMetrics["histogram"]> }).timeToFirstToken = r.histogram("ttft");
-    return m;
-  }
-
   test("first assistant message_update records TTFT event and histogram once", async () => {
-    const spanExporter = h.spanExporter;
-    const rec = h.metrics;
-    const tracker = new SpanTracker({
-      tracer: h.tracer,
-      captureContent: "full",
-      sessionId: () => "test-session",
-      sessionFile: () => "/tmp/test.jsonl",
-      cwd: "/test",
-      metrics: () => metricsWithTtft(rec),
-    });
-    tracker.startSession();
-    tracker.startInteraction("p");
-    tracker.startTurn(0);
-    tracker.startLlm("claude-4", "anthropic");
-    tracker.noteFirstToken({ role: "assistant" });
-    tracker.noteFirstToken({ role: "assistant" });
-    tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
-    tracker.endTurn();
-    tracker.endInteraction();
-    tracker.endSession();
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("claude-4", "anthropic");
+    h.tracker.noteFirstToken({ role: "assistant" });
+    h.tracker.noteFirstToken({ role: "assistant" });
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.endTurn();
+    h.tracker.endInteraction();
+    h.tracker.endSession();
     await h.flush();
-    const llm = spanExporter.getFinishedSpans().find(s => s.name === SPAN_LLM_REQUEST);
+    const llm = h.spansByName()[SPAN_LLM_REQUEST];
     assert.ok(llm);
-    const firstTokenEvents = llm!.events.filter(e => e.name === "gen_ai.first_token");
+    const firstTokenEvents = llm.events.filter(e => e.name === "gen_ai.first_token");
     assert.equal(firstTokenEvents.length, 1);
-    assert.ok(rec.histograms["ttft"]?.length === 1);
+    assert.ok(h.metrics.histograms["ttft"]?.length === 1);
   });
 });
 

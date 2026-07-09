@@ -55,6 +55,7 @@ import {
   ATTR_GEN_AI_SYSTEM,
   ATTR_GEN_AI_SYSTEM_PROMPT_HASH,
   ATTR_GEN_AI_TOKEN_TYPE,
+  GEN_AI_SYSTEM,
   ATTR_GEN_AI_TOOL_CALL_ARGUMENTS,
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_CALL_RESULT,
@@ -162,6 +163,9 @@ export class SpanTracker {
     inputTokens?: number;
     outputTokens?: number;
     reasoningTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    cacheWrite1hTokens?: number;
     httpStatus?: number;
     attempts: number;
     inputMessages: Array<Record<string, unknown>>;
@@ -171,8 +175,14 @@ export class SpanTracker {
   private tools = new Map<string, ToolSlot>();
 
   private interactionCount = 0;
-  private turnCount = 0;
-  private toolCount = 0;
+  /** Turns in the current interaction (reset each startInteraction). */
+  private interactionTurnCount = 0;
+  /** Tools in the current interaction (reset each startInteraction). */
+  private interactionToolCount = 0;
+  /** Session-lifetime turn total (never reset until endSession). */
+  private sessionTurnCount = 0;
+  /** Session-lifetime tool total (never reset until endSession). */
+  private sessionToolCount = 0;
   private sessionStartMs = 0;
   private orphanTimer: (() => void) | null = null;
   private readonly now: () => number;
@@ -225,8 +235,8 @@ export class SpanTracker {
       } catch { /* best-effort */ }
     }
     if (this.session) {
-      this.session.span.setAttribute(ATTR_PI_TURN_COUNT, this.turnCount);
-      this.session.span.setAttribute(ATTR_PI_TOOL_COUNT, this.toolCount);
+      this.session.span.setAttribute(ATTR_PI_TURN_COUNT, this.sessionTurnCount);
+      this.session.span.setAttribute(ATTR_PI_TOOL_COUNT, this.sessionToolCount);
       if (this.totalInputTokens > 0) {
         this.session.span.setAttribute(ATTR_GEN_AI_INPUT_TOKENS, this.totalInputTokens);
       }
@@ -242,6 +252,11 @@ export class SpanTracker {
       this.session.span.end();
       this.session = null;
     }
+    this.sessionTurnCount = 0;
+    this.sessionToolCount = 0;
+    this.interactionTurnCount = 0;
+    this.interactionToolCount = 0;
+    this.pendingInput = [];
     this.stopOrphanSweep();
   }
 
@@ -300,13 +315,14 @@ export class SpanTracker {
   startInteraction(prompt: string | undefined): void {
     if (this.interaction) this.endInteraction({ reason: "superseded" });
     this.interactionCount++;
-    this.turnCount = 0;
-    this.toolCount = 0;
+    this.interactionTurnCount = 0;
+    this.interactionToolCount = 0;
+    this.pendingInput = [];
     const attrs = this.commonAttrs();
     attrs[ATTR_PI_INTERACTION_ID] = this.interactionCount;
     if (typeof prompt === "string") {
       attrs[ATTR_PI_PROMPT_LENGTH] = prompt.length;
-      if (shouldCapturePrompt()) {
+      if (this.shouldCapturePrompt()) {
         attrs[ATTR_PI_USER_PROMPT] = clampAttr(prompt);
       } else {
         Object.assign(attrs, prefixKeys("pi.user_prompt", fingerprint(prompt)));
@@ -333,12 +349,13 @@ export class SpanTracker {
         // means the interaction was abandoned mid-flight.
         span.setAttribute(ATTR_PI_ORPHANED, true);
       }
-      span.setAttribute(ATTR_PI_TURN_COUNT, this.turnCount);
-      span.setAttribute(ATTR_PI_TOOL_COUNT, this.toolCount);
+      span.setAttribute(ATTR_PI_TURN_COUNT, this.interactionTurnCount);
+      span.setAttribute(ATTR_PI_TOOL_COUNT, this.interactionToolCount);
       this.setStatusFromError(span, opts.error);
       span.end();
       this.interaction = null;
       this.interactionStartMs = 0;
+      this.pendingInput = [];
     }
   }
 
@@ -346,7 +363,8 @@ export class SpanTracker {
   startTurn(turnIndex: number): void {
     if (!this.interaction) return;
     if (this.turn) this.endTurn({ reason: "superseded" });
-    this.turnCount++;
+    this.interactionTurnCount++;
+    this.sessionTurnCount++;
     const attrs = this.commonAttrs();
     attrs[ATTR_PI_TURN_INDEX] = turnIndex;
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
@@ -374,8 +392,9 @@ export class SpanTracker {
     const parent = this.turn?.ctx ?? this.interaction?.ctx ?? otelContext.active();
     const attrs = this.commonAttrs();
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
+    // Agent identity is the harness (pi). Provider identity is gen_ai.system.
+    attrs[ATTR_GEN_AI_AGENT_NAME] = GEN_AI_SYSTEM;
     if (providerSystem) {
-      attrs[ATTR_GEN_AI_AGENT_NAME] = providerSystem;
       attrs[ATTR_GEN_AI_SYSTEM] = providerSystem;
     }
     if (requestModel) attrs[ATTR_GEN_AI_REQUEST_MODEL] = requestModel;
@@ -394,6 +413,8 @@ export class SpanTracker {
       attempts: 0,
       inputMessages: [],
     };
+    // Drain any user/tool messages that arrived before the LLM span opened.
+    this.flushPendingInput();
   }
 
   noteFirstToken(message: { role?: string }): void {
@@ -449,12 +470,12 @@ export class SpanTracker {
     if (!this.llm || this.pendingInput.length === 0) return;
     for (const m of this.pendingInput) {
       if (m.role === "user") {
-        if (!shouldCapturePrompt()) continue;
+        if (!this.shouldCapturePrompt()) continue;
         const attrs: Record<string, unknown> = { role: "user", ...this.llmEventGenAiSystem() };
         attrs.content = clampAttr(m.text);
         this.llm.span.addEvent(EVENT_GEN_AI_USER_MESSAGE, attrs as Attributes);
         this.llm.inputMessages.push({ role: "user", parts: [{ type: "text", content: m.text }] });
-      } else if (shouldCaptureToolContent()) {
+      } else if (this.shouldCaptureToolContent()) {
         const attrs: Record<string, unknown> = {
           role: "tool",
           ...this.llmEventGenAiSystem(),
@@ -558,6 +579,9 @@ export class SpanTracker {
     this.llm.inputTokens = u.input;
     this.llm.outputTokens = u.output;
     this.llm.reasoningTokens = u.reasoning;
+    this.llm.cacheReadTokens = u.cacheRead;
+    this.llm.cacheWriteTokens = u.cacheWrite;
+    this.llm.cacheWrite1hTokens = u.cacheWrite1h;
   }
 
   private recordLlmMetrics(): void {
@@ -570,23 +594,28 @@ export class SpanTracker {
     if (this.llm.responseModel) base[ATTR_GEN_AI_RESPONSE_MODEL] = this.llm.responseModel;
     try {
       m.opDuration.record(elapsedSec, base);
-      if (typeof this.llm.inputTokens === "number") {
-        m.tokenUsage.record(this.llm.inputTokens, { ...base, [ATTR_GEN_AI_TOKEN_TYPE]: "input" });
-      }
-      if (typeof this.llm.outputTokens === "number") {
-        m.tokenUsage.record(this.llm.outputTokens, { ...base, [ATTR_GEN_AI_TOKEN_TYPE]: "output" });
-      }
-      if (typeof this.llm.reasoningTokens === "number") {
-        m.tokenUsage.record(this.llm.reasoningTokens, { ...base, [ATTR_GEN_AI_TOKEN_TYPE]: "reasoning" });
-      }
+      // Input/output are always recorded when present (including zero). Cache
+      // and reasoning types only when positive so every request does not emit
+      // a stack of zero-valued series.
+      const recordTokens = (value: number | undefined, tokenType: string, requirePositive = false) => {
+        if (typeof value !== "number" || !Number.isFinite(value)) return;
+        if (requirePositive && value <= 0) return;
+        m.tokenUsage.record(value, { ...base, [ATTR_GEN_AI_TOKEN_TYPE]: tokenType });
+      };
+      recordTokens(this.llm.inputTokens, "input");
+      recordTokens(this.llm.outputTokens, "output");
+      recordTokens(this.llm.cacheReadTokens, "cache_read", true);
+      recordTokens(this.llm.cacheWriteTokens, "cache_write", true);
+      recordTokens(this.llm.cacheWrite1hTokens, "cache_write_1h", true);
+      recordTokens(this.llm.reasoningTokens, "reasoning", true);
     } catch { /* best-effort */ }
   }
 
   private emitAssistantMessageEvents(m: MessageShapes.AssistantMessage): void {
     if (!this.llm) return;
     const text = extractAssistantText(m);
-    const toolCalls = extractToolCalls(m);
-    if (shouldCapturePrompt()) {
+    const toolCalls = extractToolCalls(m, this.shouldCaptureToolContent());
+    if (this.shouldCapturePrompt()) {
       const asstAttrs: Record<string, unknown> = { role: "assistant", ...this.llmEventGenAiSystem() };
       if (text) asstAttrs.content = clampAttr(text);
       if (toolCalls.length) asstAttrs["tool_calls"] = clampAttr(toolCalls);
@@ -620,7 +649,7 @@ export class SpanTracker {
     const attrs = this.commonAttrs();
     attrs[ATTR_GEN_AI_TOOL_NAME] = toolName;
     attrs[ATTR_GEN_AI_TOOL_CALL_ID] = toolCallId;
-    if (shouldCaptureToolContent() && input !== undefined) {
+    if (this.shouldCaptureToolContent() && input !== undefined) {
       attrs[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS] = clampAttr(input);
     }
     const spanOptions: { attributes: Attributes; links?: Array<{ context: SpanContext }> } = { attributes: attrs };
@@ -642,7 +671,8 @@ export class SpanTracker {
       startNs: process.hrtime.bigint(),
       startMs: this.now(),
     });
-    this.toolCount++;
+    this.interactionToolCount++;
+    this.sessionToolCount++;
   }
 
   endTool(toolCallId: string, isError: boolean, result: unknown): void {
@@ -650,7 +680,7 @@ export class SpanTracker {
     if (!slot) return;
     this.tools.delete(toolCallId);
     slot.span.setAttribute(ATTR_PI_TOOL_IS_ERROR, isError);
-    if (shouldCaptureToolContent() && result !== undefined) {
+    if (this.shouldCaptureToolContent() && result !== undefined) {
       slot.span.setAttribute(ATTR_GEN_AI_TOOL_CALL_RESULT, clampAttr(result));
     }
     const elapsedMs = Number(process.hrtime.bigint() - slot.startNs) / 1e6;
@@ -736,25 +766,17 @@ export class SpanTracker {
   activeTraceId(): string | undefined {
     return (this.session ?? this.interaction)?.span.spanContext().traceId;
   }
-}
 
-// ---------------------------------------------------------------------------
-// Module-private content-capture gates
-// ---------------------------------------------------------------------------
+  /** Prompt/completion text is captured in full and no_tool_content modes. */
+  private shouldCapturePrompt(): boolean {
+    const c = this.opts.captureContent;
+    return c === "no_tool_content" || c === "full";
+  }
 
-function shouldCapturePrompt(): boolean {
-  // Resolved at runtime via the tracker's options; mirror that logic here.
-  // Captured via closure below to avoid passing captureContent around.
-  return CAPTURE_PROMPTS;
-}
-function shouldCaptureToolContent(): boolean {
-  return CAPTURE_TOOL;
-}
-let CAPTURE_PROMPTS = true;
-let CAPTURE_TOOL = true;
-export function configureCapture(c: ContentCapture): void {
-  CAPTURE_PROMPTS = c === "no_tool_content" || c === "full";
-  CAPTURE_TOOL = c === "full";
+  /** Tool args/results are captured only in full mode. */
+  private shouldCaptureToolContent(): boolean {
+    return this.opts.captureContent === "full";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -769,7 +791,10 @@ function extractAssistantText(m: MessageShapes.AssistantMessage): string {
   return parts.join("\n");
 }
 
-function extractToolCalls(m: MessageShapes.AssistantMessage): Array<{
+function extractToolCalls(
+  m: MessageShapes.AssistantMessage,
+  captureToolArgs: boolean,
+): Array<{
   id: string;
   type: "function";
   function: { name: string; arguments?: string };
@@ -779,7 +804,7 @@ function extractToolCalls(m: MessageShapes.AssistantMessage): Array<{
     if (p.type !== "toolCall") continue;
     const tc = p;
     const fn: { name: string; arguments?: string } = { name: tc.name };
-    if (shouldCaptureToolContent()) {
+    if (captureToolArgs) {
       fn.arguments = typeof tc.arguments === "string" ? tc.arguments : clampAttr(tc.arguments);
     }
     out.push({ id: tc.id, type: "function", function: fn });
