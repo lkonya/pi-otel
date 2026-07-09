@@ -32,8 +32,6 @@ import { SeverityNumber } from "@opentelemetry/api-logs";
 import { resolveConfig } from "./config.js";
 import { registerCommands } from "./commands.js";
 import { emitLog } from "./logging.js";
-import { getMetrics, resetMetrics } from "./metrics.js";
-import { resetLogger } from "./logging.js";
 import { type TelemetryRuntime, startRuntime } from "./sdk.js";
 import { clampAttr } from "./attrs.js";
 import { extractMessageText, SpanTracker, type SessionReason } from "./tracker.js";
@@ -87,6 +85,8 @@ export default function (pi: ExtensionAPI): void {
   let abortCleanup: (() => void) | null = null;
   /** True once we have logged an HTTP-level LLM error for the open request. */
   let llmHttpErrorLogged = false;
+  /** Serializes session start/stop so concurrent session_start cannot double-build a runtime. */
+  let lifecycle: Promise<void> = Promise.resolve();
 
   registerCommands(pi, () => runtime);
 
@@ -97,7 +97,7 @@ export default function (pi: ExtensionAPI): void {
     const payload = normalizeLogPayload(data);
     if (!payload) return;
     emitLog(
-      runtime?.loggerProvider,
+      runtime?.logger,
       payload.eventName,
       payload.severity,
       payload.body,
@@ -129,40 +129,49 @@ export default function (pi: ExtensionAPI): void {
   };
 
   const start = async (ctx: ExtensionContext, reason?: SessionReason, parentId?: string): Promise<void> => {
-    if (runtime) return; // idempotent
-    // Re-resolve config with the session's cwd so project settings win.
-    cfg = resolveConfig(ctx.cwd);
-    if (!cfg.enabled) return;
-    runtime = await startRuntime(cfg, { hasUI: ctx.hasUI });
-    resetMetrics();
-    resetLogger();
-    tracker = new SpanTracker({
-      tracer: runtime.tracer,
-      captureContent: cfg.captureContent,
-      sessionId,
-      sessionFile,
-      cwd: ctx.cwd,
-      metrics: () => getMetrics(runtime?.meterProvider),
+    // Chain on the lifecycle queue so two concurrent session_start events
+    // cannot both pass a null runtime check and build two SDKs.
+    const run = lifecycle.then(async () => {
+      if (runtime) return; // idempotent once the prior start finished
+      // Re-resolve config with the session's cwd so project settings win.
+      cfg = resolveConfig(ctx.cwd);
+      if (!cfg.enabled) return;
+      const next = await startRuntime(cfg, { hasUI: ctx.hasUI });
+      runtime = next;
+      tracker = new SpanTracker({
+        tracer: next.tracer,
+        captureContent: cfg.captureContent,
+        sessionId,
+        sessionFile,
+        cwd: ctx.cwd,
+        metrics: () => next.metrics,
+      });
+      tracker.startSession(reason, parentId);
     });
-    tracker.startSession(reason, parentId);
+    lifecycle = run.catch(() => {});
+    await run;
   };
 
   const stop = async (_reason: string): Promise<void> => {
-    clearAbortListener();
-    try {
-      tracker?.endSession();
-    } catch { /* best-effort */ }
-    tracker = null;
-    if (runtime) {
-      // Always shut down: batch processors and metric readers keep ticking
-      // after a bare flush. The next session_start builds a fresh runtime.
-      // removeProcessHooks runs inside shutdown; call it first so a slow
-      // shutdown cannot leave signal handlers stacked if start() races.
-      runtime.removeProcessHooks();
-      await runtime.shutdown();
-    }
-    runtime = null;
-    llmHttpErrorLogged = false;
+    const run = lifecycle.then(async () => {
+      clearAbortListener();
+      try {
+        tracker?.endSession();
+      } catch { /* best-effort */ }
+      tracker = null;
+      if (runtime) {
+        // Always shut down: batch processors and metric readers keep ticking
+        // after a bare flush. The next session_start builds a fresh runtime.
+        // removeProcessHooks runs inside shutdown; call it first so a slow
+        // shutdown cannot leave signal handlers stacked if start() races.
+        runtime.removeProcessHooks();
+        await runtime.shutdown();
+      }
+      runtime = null;
+      llmHttpErrorLogged = false;
+    });
+    lifecycle = run.catch(() => {});
+    await run;
   };
 
   // ----------------------------------------------------------------- events
@@ -174,7 +183,7 @@ export default function (pi: ExtensionAPI): void {
     await start(ctx, event.reason, parentId);
     if (cfg.selfLogs && runtime) {
       emitLog(
-        runtime.loggerProvider,
+        runtime.logger,
         "pi.session.start",
         SeverityNumber.INFO,
         `pi session ${sessionId() ?? "(ephemeral)"} started`,
@@ -185,13 +194,13 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async (event, _ctx) => {
     const sid = sessionId();
-    const loggerProvider = runtime?.loggerProvider;
+    const logger = runtime?.logger;
     const selfLogs = cfg.selfLogs;
     // Emit pi.session.end before tearing the runtime down: once shutdown runs,
     // the logger provider is gone and the record would never flush.
     if (selfLogs) {
       emitLog(
-        loggerProvider,
+        logger,
         "pi.session.end",
         SeverityNumber.INFO,
         `pi session ${sid ?? "(ephemeral)"} ended (${event.reason})`,
@@ -225,14 +234,14 @@ export default function (pi: ExtensionAPI): void {
       attrs["pi.compaction.tokens_before"] = event.compactionEntry.tokensBefore;
     }
     runtime && cfg.selfLogs && emitLog(
-      runtime.loggerProvider,
+      runtime.logger,
       "pi.session.compact",
       SeverityNumber.INFO,
       `session compacted (${event.reason})`,
       attrs,
     );
     try {
-      getMetrics(runtime?.meterProvider)?.compactionCount.add(1, attrs as Record<string, string>);
+      runtime?.metrics?.compactionCount.add(1, attrs);
     } catch { /* noop */ }
   });
 
@@ -256,7 +265,7 @@ export default function (pi: ExtensionAPI): void {
         // mashing Esc outside a turn does not inflate the counter.
         const cancelled = tracker?.markCancelled() ?? false;
         if (cancelled) {
-          try { getMetrics(runtime?.meterProvider)?.turnCancellations.add(1); } catch { /* noop */ }
+          try { runtime?.metrics?.turnCancellations.add(1); } catch { /* noop */ }
         }
       };
       signal.addEventListener("abort", onAbort, { once: true });
@@ -277,7 +286,7 @@ export default function (pi: ExtensionAPI): void {
       // HTTP failure for this request.
       if (cfg.selfLogs && (finish === "error" || finish === "aborted") && !llmHttpErrorLogged) {
         emitLog(
-          runtime?.loggerProvider,
+          runtime?.logger,
           "pi.llm_request.error",
           finish === "aborted" ? SeverityNumber.WARN : SeverityNumber.ERROR,
           errMsg ?? `llm request ${finish}`,
@@ -300,7 +309,7 @@ export default function (pi: ExtensionAPI): void {
     if (event.status >= 400 && cfg.selfLogs) {
       llmHttpErrorLogged = true;
       emitLog(
-        runtime?.loggerProvider,
+        runtime?.logger,
         "pi.llm_request.error",
         SeverityNumber.ERROR,
         `provider response HTTP ${event.status}`,
@@ -342,7 +351,7 @@ export default function (pi: ExtensionAPI): void {
     tracker?.endTool(event.toolCallId, event.isError, event.result);
     if (event.isError && cfg.selfLogs) {
       emitLog(
-        runtime?.loggerProvider,
+        runtime?.logger,
         "pi.tool.error",
         SeverityNumber.ERROR,
         `tool ${event.toolName} failed`,
@@ -361,7 +370,7 @@ export default function (pi: ExtensionAPI): void {
     }
     attrs["pi.model.current"] = `${event.model.provider}/${event.model.id}`;
     runtime && cfg.selfLogs && emitLog(
-      runtime.loggerProvider,
+      runtime.logger,
       "pi.model.changed",
       SeverityNumber.INFO,
       `model changed: ${attrs["pi.model.current"]}`,
@@ -372,7 +381,7 @@ export default function (pi: ExtensionAPI): void {
   // ------------------------------------------------------------- user bash
   pi.on("user_bash", async (event, _ctx) => {
     runtime && cfg.selfLogs && emitLog(
-      runtime.loggerProvider,
+      runtime.logger,
       "pi.user_bash",
       SeverityNumber.INFO,
       `user bash: ${event.command.slice(0, 120)}`,
@@ -383,7 +392,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("input", async (event, _ctx) => {
     if (event.source !== "interactive") return;
     runtime && cfg.selfLogs && emitLog(
-      runtime.loggerProvider,
+      runtime.logger,
       "pi.input",
       SeverityNumber.INFO,
       `user input (${event.source})`,

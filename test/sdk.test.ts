@@ -58,6 +58,8 @@ describe("startRuntime", () => {
       assert.ok(rt.meterProvider, "meter provider present");
       assert.ok(rt.loggerProvider, "logger provider present");
       assert.ok(rt.tracer, "tracer present");
+      assert.ok(rt.metrics, "metrics bound to this runtime");
+      assert.ok(rt.logger, "logger bound to this runtime");
       assert.ok(typeof rt.flush === "function");
       assert.ok(typeof rt.shutdown === "function");
     } finally {
@@ -82,8 +84,17 @@ describe("startRuntime", () => {
       assert.equal(rt.traceProvider, undefined);
       assert.equal(rt.meterProvider, undefined);
       assert.equal(rt.loggerProvider, undefined);
+      assert.equal(rt.metrics, null, "no metrics without a meter provider");
+      assert.equal(rt.logger, null, "no logger without a logger provider");
       // tracer still returned (no-op) so callers don't have to branch
       assert.ok(rt.tracer);
+      // no-op span methods must be safe to call
+      const span = rt.tracer.startSpan("disabled");
+      assert.equal(span.isRecording(), false);
+      span.setAttribute("k", "v");
+      span.addEvent("e");
+      span.updateName("x");
+      span.end();
     } finally {
       await rt.shutdown();
     }

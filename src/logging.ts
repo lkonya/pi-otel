@@ -1,5 +1,5 @@
 /**
- * Log record emission and message-content helpers.
+ * Log record emission.
  *
  * The extension's own lifecycle events are emitted as OTLP log records with an
  * `event.name` attribute, following the OTel "event" semantic convention.
@@ -8,6 +8,9 @@
  *
  * The OTel SDK's internal `diag` is never routed back through OTLP — that
  * would recurse. diag stays at NONE unless explicitly raised via OTEL_LOG_LEVEL.
+ *
+ * Callers pass a Logger bound to the active TelemetryRuntime. There is no
+ * process-wide logger cache, so a reload cannot emit into a shut-down provider.
  */
 
 import type { Logger } from "@opentelemetry/api-logs";
@@ -18,16 +21,10 @@ import { extensionVersion } from "./version.js";
 const LOGGER_NAME = "pi-otel";
 const LOGGER_VERSION = extensionVersion();
 
-let cachedLogger: Logger | null = null;
-
-export function resetLogger(): void {
-  cachedLogger = null;
-}
-
-function logger(provider?: LoggerProvider): Logger | null {
+/** Create a Logger bound to this provider, or null when logs are off. */
+export function createLogger(provider: LoggerProvider | null | undefined): Logger | null {
   if (!provider) return null;
-  if (!cachedLogger) cachedLogger = provider.getLogger(LOGGER_NAME, LOGGER_VERSION);
-  return cachedLogger;
+  return provider.getLogger(LOGGER_NAME, LOGGER_VERSION);
 }
 
 const SEVERITY_MAP: Record<string, SeverityNumber> = {
@@ -46,19 +43,18 @@ const SEVERITY_MAP: Record<string, SeverityNumber> = {
  * discrete events (pi.session.start, pi.tool.error, ...).
  */
 export function emitLog(
-  provider: LoggerProvider | undefined,
+  logger: Logger | null | undefined,
   eventName: string,
   severity: SeverityNumber | keyof typeof SEVERITY_MAP,
   body: string,
   attrs: LogAttributes = {},
 ): void {
-  const log = logger(provider);
-  if (!log) return;
+  if (!logger) return;
   try {
     const sev = typeof severity === "string"
       ? (SEVERITY_MAP[severity] ?? SeverityNumber.INFO)
       : severity;
-    log.emit({
+    logger.emit({
       severityNumber: sev,
       severityText: SeverityNumber[sev],
       body,

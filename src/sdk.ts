@@ -59,6 +59,9 @@ import {
   ATTR_SERVICE_VERSION,
 } from "@opentelemetry/semantic-conventions";
 import type { ExporterToken, Protocol, ResolvedConfig } from "./config.js";
+import { createMetrics, type Metrics } from "./metrics.js";
+import { createLogger } from "./logging.js";
+import type { Logger } from "@opentelemetry/api-logs";
 
 const TRACER_NAME = "pi-otel";
 const TRACER_VERSION = extensionVersion();
@@ -87,6 +90,10 @@ export interface RuntimeOptions {
 export interface TelemetryRuntime {
   config: ResolvedConfig;
   tracer: Tracer;
+  /** Metric instruments bound to this runtime's meter provider (null if metrics off). */
+  metrics: Metrics | null;
+  /** Logger bound to this runtime's logger provider (null if logs off). */
+  logger: Logger | null;
   loggerProvider?: LoggerProvider;
   meterProvider?: MeterProvider;
   traceProvider?: BasicTracerProvider;
@@ -383,6 +390,10 @@ export async function startRuntime(
   }
 
   const tracer = traceProvider?.getTracer(TRACER_NAME, TRACER_VERSION) ?? noopTracer();
+  // Bind instruments/logger to this runtime so a reload cannot keep writing
+  // into a provider that has already been shut down.
+  const metrics = createMetrics(meterProvider);
+  const logger = createLogger(loggerProvider);
 
   let shutdownStarted = false;
 
@@ -423,7 +434,19 @@ export async function startRuntime(
     await shutdownProviders(traceProvider, meterProvider, loggerProvider, cfg.shutdownTimeoutMs, health);
   };
 
-  return { config: cfg, tracer, traceProvider, meterProvider, loggerProvider, health, flush, shutdown, removeProcessHooks };
+  return {
+    config: cfg,
+    tracer,
+    metrics,
+    logger,
+    traceProvider,
+    meterProvider,
+    loggerProvider,
+    health,
+    flush,
+    shutdown,
+    removeProcessHooks,
+  };
 }
 
 /** Minimal provider surface that shutdown needs: forceFlush + shutdown. */
@@ -482,17 +505,30 @@ function noopDiagLogger(): DiagLogger {
 }
 
 function noopTracer(): Tracer {
-  // Minimal no-op tracer to satisfy the type when traces are disabled.
-  // The real trace API trace.getTracer returns a no-op tracer too, but we
-  // avoid importing the global to keep this module self-contained.
-  const startSpan = () => ({
+  // Full Span surface so a traces-disabled path never throws on a missing
+  // method if a caller or future OTel API path exercises more of the type.
+  // We build this locally rather than using the global no-op tracer so this
+  // module never registers or reads global providers.
+  const noopSpan = {
     spanContext: () => ({ traceId: "", spanId: "", traceFlags: 0, isRemote: false }),
-    setAttribute: () => {},
-    setAttributes: () => {},
-    addEvent: () => {},
-    setStatus: () => {},
-    recordException: () => {},
-    end: () => {},
-  });
-  return { startSpan } as unknown as Tracer;
+    setAttribute() { return this; },
+    setAttributes() { return this; },
+    addEvent() { return this; },
+    addLink() { return this; },
+    addLinks() { return this; },
+    setStatus() { return this; },
+    updateName() { return this; },
+    end() {},
+    isRecording() { return false; },
+    recordException() {},
+  };
+  return {
+    startSpan: () => noopSpan,
+    startActiveSpan: (_name: string, ...args: unknown[]) => {
+      // OTel overloads: (name, fn) | (name, options, fn) | (name, options, context, fn)
+      const fn = args[args.length - 1];
+      if (typeof fn === "function") return (fn as (span: typeof noopSpan) => unknown)(noopSpan);
+      return noopSpan;
+    },
+  } as Tracer;
 }

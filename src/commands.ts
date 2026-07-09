@@ -93,7 +93,7 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
       }
       // --- Log ---
       if (c.logs.enabled && c.selfLogs) {
-        emitLog(rt.loggerProvider, "pi.otel.self_test", SeverityNumber.INFO, "pi-otel self-test log record", {
+        emitLog(rt.logger, "pi.otel.self_test", SeverityNumber.INFO, "pi-otel self-test log record", {
           "pi.test": true,
         });
       }

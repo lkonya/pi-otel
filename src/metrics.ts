@@ -1,10 +1,14 @@
 /**
- * Metric instrument handles, lazily created from a MeterProvider.
+ * Metric instrument handles, created from a MeterProvider.
  *
  * Metric names follow GenAI semconv where one exists, else `pi.*`.
  * Histograms are used for distributions (token counts, durations); counters
  * for monotonic totals. Token usage is a histogram (not a counter) per spec,
  * so backends can show p50/p95 token distributions.
+ *
+ * Instruments are bound to the provider passed in. There is no process-wide
+ * cache: each TelemetryRuntime owns its own Metrics instance so a reload
+ * cannot keep writing to a shut-down provider.
  */
 
 import { type Counter, type Histogram, type MeterProvider } from "@opentelemetry/api";
@@ -49,15 +53,11 @@ export interface Metrics {
   compactionCount: Counter;
 }
 
-let cached: Metrics | null = null;
-
-/** Resolve metric handles from the given MeterProvider. Returns null if null is passed. */
-export function getMetrics(provider: MeterProvider | null | undefined): Metrics | null {
+/** Create metric handles bound to this MeterProvider. Returns null if no provider. */
+export function createMetrics(provider: MeterProvider | null | undefined): Metrics | null {
   if (!provider) return null;
-  if (cached) return cached;
   const meter = provider.getMeter(METER_NAME, METER_VERSION);
-  // The no-op meter (no provider) returns functional no-op instruments.
-  cached = {
+  return {
     opDuration: meter.createHistogram(METRIC_OP_DURATION, {
       description: "Duration of GenAI client operations",
       unit: "s",
@@ -103,9 +103,4 @@ export function getMetrics(provider: MeterProvider | null | undefined): Metrics 
       unit: "{event}",
     }),
   };
-  return cached;
-}
-
-export function resetMetrics(): void {
-  cached = null;
 }
