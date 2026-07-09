@@ -40,13 +40,13 @@ Token usage uses a histogram. The semconv is explicit about this. Histograms let
 
 **Works with every OTLP backend.** Point the extension at a hosted platform, a self-hosted collector, or a local dev backend. It emits standard OTLP and strict semantic conventions, so the backend does any translation it needs. Auth is standard `OTEL_EXPORTER_OTLP_HEADERS`.
 
-**Speaks GenAI semantic conventions natively.** LLM spans carry the full `gen_ai.*` attribute set: token usage by type, cost, request and response model, response id, finish reasons, tool call id, name, arguments, and result, plus `gen_ai.input.messages` and `gen_ai.output.messages` JSON for AI panels. `gen_ai.system` carries the real provider (`anthropic`, `openai`, `zai`, etc.) so backends group by vendor correctly. Backends that read GenAI semconv render your agent traces as model calls with no extra setup on their side.
+**Speaks GenAI semantic conventions natively.** LLM spans carry the full `gen_ai.*` attribute set: token usage by type, cost, request and response model, response id, finish reasons, tool call id, name, arguments, and result, plus `gen_ai.input.messages` and `gen_ai.output.messages` JSON for AI panels. `gen_ai.system` carries the real provider (`anthropic`, `openai`, `zai`, etc.) so backends group by vendor correctly. `gen_ai.agent.name` is `pi`, the agent harness. Backends that read GenAI semconv render your agent traces as model calls with no extra setup on their side.
 
 **Captures Anthropic's 1-hour cache split.** Anthropic reports cache writes two ways: 5-minute retention and 1-hour retention, at different prices. Most agent exporters fold both into `cache_write` and lose the split, which makes cost analysis wrong. You get both `gen_ai.usage.cache_write_input_tokens` and `gen_ai.usage.cache_write_1h_input_tokens`, so your cost dashboards stay accurate.
 
 **Runs HTTP/protobuf by default, gRPC on demand.** HTTP/protobuf is the OTel spec default, needs no native dependencies, works with every backend on port 4318, and debugs with `curl`. Flip to gRPC with `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` when you want HTTP/2 multiplexing for high telemetry volume.
 
-**Survives `/reload` and session replacement.** Pi reloads extensions per session in the same process. A global provider set on the first session turns into a zombie after `/reload`, silently dropping every span. The tracker scopes every SDK object (provider, processor, reader, exporter) to a session: created at `session_start`, torn down at `session_shutdown`. A fresh session gets a fresh SDK. The test suite asserts this property.
+**Survives `/reload` and session replacement.** Pi reloads extensions per session in the same process. A global provider set on the first session turns into a zombie after `/reload`, dropping every span. The tracker scopes every SDK object (provider, processor, reader, exporter) to a session: created at `session_start`, shut down at every `session_shutdown` (quit, new, resume, fork, reload). A fresh session gets a fresh SDK. The test suite asserts this property.
 
 **Never leaks orphan spans.** Replace a session (`/new`, `/resume`, `/fork`, compaction, tree navigation) or abort a turn with Esc and the tracker closes every open span, marked `pi.orphaned` or `pi.cancelled` so you can tell abandoned spans from normal ones in the backend.
 
@@ -66,7 +66,7 @@ Token usage uses a histogram. The semconv is explicit about this. Histograms let
 
 **Dial content capture per project.** `captureContent` defaults to `full` and ships prompts, completions, and tool input and output to your backend, clamped to 64 KiB per attribute to fit collector limits. Drop to `no_tool_content` to keep prompts but hash tool input and output, the surface where secrets flow. Drop to `metadata_only` to emit only byte counts, line counts, and a hash, with no raw payloads leaving the machine. The hashes still let you correlate and dedupe across sessions without exfiltrating the underlying text. Three modes, no code changes.
 
-**Keeps PII off by default.** Resource attributes come from the SDK's host, process, and OS detectors plus explicit `service.*` and `pi.*` values. The extension never reads git config or your OS username to populate `enduser.id`. Set `OTEL_RESOURCE_ATTRIBUTES="enduser.id=alice@corp.com"` to opt into per-developer attribution on your terms.
+**Keeps enduser attribution opt-in.** Resource attributes come from the SDK's host, process, and OS detectors plus explicit `service.*` and `pi.*` values. `process.owner` is the OS username (standard OTel process semconv). The extension never reads git config or invents `enduser.id`. Set `OTEL_RESOURCE_ATTRIBUTES="enduser.id=alice@corp.com"` when you want per-developer attribution.
 
 **Auto-populates rich resource attributes.** The SDK's host, process, OS, and service-instance detectors fill in `host.id`, `host.name`, `process.pid`, `process.executable.*`, `process.command*`, `process.owner`, `process.runtime.*`, `os.*`, and `service.instance.id`. Your backend gets stable host and process identity for filtering and grouping with no manual config.
 
@@ -85,6 +85,8 @@ pi install git:github.com/stnly/pi-otel
 ```
 
 Then `/reload` in pi, or restart.
+
+This package ships TypeScript source under `src/` and is loaded by pi via jiti. It is not a precompiled library API for general Node imports.
 
 ## Quick start
 
@@ -147,6 +149,7 @@ Sources, highest precedence first:
     "protocol": "http/protobuf",
     "headers": { "x-api-key": "..." },
     "serviceName": "pi",
+    "resourceAttributes": { "deployment.env": "dev" },
     "captureContent": "full",
     "sampleRatio": 1.0,
     "metricExportInterval": 10000,

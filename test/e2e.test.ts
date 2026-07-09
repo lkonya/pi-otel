@@ -21,8 +21,17 @@ const ENDPOINT = `http://127.0.0.1:${SINK_PORT}`;
 
 let server: Server;
 const received = { traces: [] as Buffer[], metrics: [] as Buffer[], logs: [] as Buffer[] };
+const savedEnv: Record<string, string | undefined> = {};
+const E2E_ENV_KEYS = [
+  "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_METRIC_EXPORT_INTERVAL",
+  "PI_OTEL_DISABLED",
+] as const;
 
 before(async () => {
+  for (const k of E2E_ENV_KEYS) {
+    savedEnv[k] = process.env[k];
+  }
   server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c as Buffer));
@@ -46,6 +55,10 @@ after(async () => {
   // closeAllConnections drops any lingering keep-alive sockets before close().
   server.closeAllConnections?.();
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  for (const k of E2E_ENV_KEYS) {
+    if (savedEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = savedEnv[k];
+  }
 });
 
 function resetReceived() {
