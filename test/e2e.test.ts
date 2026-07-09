@@ -180,6 +180,69 @@ describe("end-to-end over real HTTP OTLP", () => {
     // No throw is the implicit pass condition above.
   });
 
+  test("sequential non-quit sessions each export; first runtime is fully shut down", async () => {
+    // Locks the always-shutdown path: after session_shutdown(reason=new) the
+    // previous providers must not keep exporting. A second session starts a
+    // fresh runtime and its own exports land independently.
+    resetReceived();
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = ENDPOINT;
+    const { pi, handlers, ctx } = fakePi();
+    const mod = await import("../src/index.ts");
+    mod.default(pi);
+    const emit = async (event: string, payload: any) => {
+      const h = handlers.get(event);
+      if (h) await h({ type: event, ...payload }, ctx);
+    };
+
+    // Session A: one span tree, shut down with non-quit reason.
+    await emit("session_start", { reason: "startup" });
+    await emit("before_agent_start", { prompt: "session-a", systemPrompt: "" });
+    await emit("turn_start", { turnIndex: 0, timestamp: Date.now() });
+    await emit("before_provider_request", { payload: {} });
+    await emit("after_provider_response", { status: 200, headers: {} });
+    await emit("turn_end", {
+      turnIndex: 0,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "a" }],
+        model: "test-model",
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+        stopReason: "stop",
+      },
+    });
+    await emit("agent_end", { messages: [] });
+    await emit("session_shutdown", { reason: "new" });
+    const afterA = received.traces.length;
+    assert.ok(afterA > 0, "session A exported traces on non-quit shutdown");
+    const aBlob = received.traces.map(b => b.toString("latin1")).join("");
+    assert.ok(aBlob.includes("session-a") || aBlob.includes("pi.session"), "session A payload present");
+
+    // After A is shut down, no further spontaneous exports should arrive.
+    const mid = received.traces.length;
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(received.traces.length, mid, "no zombie exports after session A shutdown");
+
+    // Session B: fresh runtime, independent export.
+    await emit("session_start", { reason: "new" });
+    await emit("before_agent_start", { prompt: "session-b", systemPrompt: "" });
+    await emit("turn_start", { turnIndex: 0, timestamp: Date.now() });
+    await emit("before_provider_request", { payload: {} });
+    await emit("after_provider_response", { status: 200, headers: {} });
+    await emit("turn_end", {
+      turnIndex: 0,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "b" }],
+        model: "test-model",
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+        stopReason: "stop",
+      },
+    });
+    await emit("agent_end", { messages: [] });
+    await emit("session_shutdown", { reason: "quit" });
+    assert.ok(received.traces.length > afterA, "session B exported additional traces");
+  });
+
   test("disabled via PI_OTEL_DISABLED=1 exports nothing", async () => {
     resetReceived();
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT = ENDPOINT;
