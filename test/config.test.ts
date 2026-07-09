@@ -424,6 +424,23 @@ describe("settings.json", () => {
       rmrf(tmp);
     }
   });
+
+  test("settings resourceAttributes merge under env OTEL_RESOURCE_ATTRIBUTES", () => {
+    const tmp = mkProjectSettings({
+      otel: {
+        resourceAttributes: { "deployment.env": "from-settings", team: "settings-team" },
+      },
+    });
+    try {
+      process.env.OTEL_RESOURCE_ATTRIBUTES = "deployment.env=from-env,region=us";
+      const c = resolveConfig(tmp);
+      assert.equal(c.resourceAttributes["deployment.env"], "from-env", "env overrides settings");
+      assert.equal(c.resourceAttributes.team, "settings-team", "settings-only key kept");
+      assert.equal(c.resourceAttributes.region, "us", "env-only key present");
+    } finally {
+      rmrf(tmp);
+    }
+  });
 });
 
 // --- helpers ----------------------------------------------------------------

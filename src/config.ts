@@ -288,7 +288,11 @@ export function resolveConfig(cwd: string): ResolvedConfig {
     protocol,
     headers,
     serviceName: envStr("OTEL_SERVICE_NAME", "PI_OTEL_SERVICE_NAME") ?? s.serviceName ?? "pi",
-    resourceAttributes: parseKv(process.env.OTEL_RESOURCE_ATTRIBUTES, true),
+    // Settings first; OTEL_RESOURCE_ATTRIBUTES overrides and extends.
+    resourceAttributes: {
+      ...(s.resourceAttributes ?? {}),
+      ...parseKv(process.env.OTEL_RESOURCE_ATTRIBUTES, true),
+    },
     captureContent: normalizeCapture(envStr("PI_OTEL_CAPTURE_CONTENT") ?? s.captureContent),
     sampleRatio,
     metricExportInterval: envNum(["OTEL_METRIC_EXPORT_INTERVAL", "PI_OTEL_METRIC_EXPORT_INTERVAL"], s.metricExportInterval ?? 10000),
