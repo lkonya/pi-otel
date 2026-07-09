@@ -499,7 +499,9 @@ export class SpanTracker {
     this.llm.attempts++;
     this.llm.httpStatus = status;
     this.llm.span.setAttribute(ATTR_HTTP_STATUS_CODE, status);
-    const respId = headers["x-request-id"] ?? headers["request-id"] ?? headers["anthropic-request-id"] ?? headers["openai-response-id"];
+    // HTTP header names are case-insensitive; normalize so mixed-case maps still match.
+    const hdr = lowercaseKeys(headers);
+    const respId = hdr["x-request-id"] ?? hdr["request-id"] ?? hdr["anthropic-request-id"] ?? hdr["openai-response-id"];
     if (respId) this.llm.span.setAttribute(ATTR_GEN_AI_RESPONSE_ID, respId);
     const retry = this.llm.attempts > 1;
     if (retry) {
@@ -833,6 +835,12 @@ export function extractMessageText(message: { content?: unknown }): string {
 function prefixKeys(prefix: string, obj: Record<string, number | string>): Record<string, number | string> {
   const out: Record<string, number | string> = {};
   for (const [k, v] of Object.entries(obj)) out[`${prefix}.${k}`] = v;
+  return out;
+}
+
+function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) out[k.toLowerCase()] = v;
   return out;
 }
 

@@ -304,6 +304,18 @@ describe("llm usage attribution", () => {
     assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_RESPONSE_ID], "from-message");
   });
 
+  test("response.id from mixed-case header names", async () => {
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.recordProviderResponse(200, { "X-Request-Id": "mixed-case-id" });
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }));
+    h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
+    await h.flush();
+    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_RESPONSE_ID], "mixed-case-id");
+  });
+
   test("records http.response.status_code from provider response", async () => {
     h.tracker.startSession();
     h.tracker.startInteraction("p");
