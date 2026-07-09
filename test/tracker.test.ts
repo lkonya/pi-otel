@@ -1049,32 +1049,29 @@ describe("system prompt hash", () => {
 });
 
 describe("error categorization", () => {
-  test("recordProviderResponse 429 sets rate_limit", async () => {
+  async function httpErrorType(status: number): Promise<string | undefined> {
+    h.reset();
     h.tracker.startSession();
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
-    h.tracker.recordProviderResponse(429, {});
+    h.tracker.recordProviderResponse(status, {});
     h.tracker.completeLlm(asstMsg({ stopReason: "error" }) as never);
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes["error.type"], "rate_limit");
-  });
+    return h.spansByName()[SPAN_LLM_REQUEST].attributes["error.type"] as string | undefined;
+  }
 
-  test("recordProviderResponse 500 sets server_error", async () => {
-    h.tracker.startSession();
-    h.tracker.startInteraction("p");
-    h.tracker.startTurn(0);
-    h.tracker.startLlm("m", "p");
-    h.tracker.recordProviderResponse(500, {});
-    h.tracker.completeLlm(asstMsg({ stopReason: "error" }) as never);
-    h.tracker.endTurn();
-    h.tracker.endInteraction();
-    h.tracker.endSession();
-    await h.flush();
-    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes["error.type"], "server_error");
+  test("recordProviderResponse maps HTTP statuses to error.type", async () => {
+    assert.equal(await httpErrorType(429), "rate_limit");
+    assert.equal(await httpErrorType(500), "server_error");
+    assert.equal(await httpErrorType(401), "auth_error");
+    assert.equal(await httpErrorType(403), "auth_error");
+    assert.equal(await httpErrorType(408), "timeout");
+    assert.equal(await httpErrorType(413), "request_too_large");
+    assert.equal(await httpErrorType(400), "client_error");
   });
 });
 
