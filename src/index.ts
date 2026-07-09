@@ -36,7 +36,7 @@ import { getMetrics, resetMetrics } from "./metrics.js";
 import { resetLogger } from "./logging.js";
 import { type TelemetryRuntime, startRuntime } from "./sdk.js";
 import { clampAttr } from "./attrs.js";
-import { configureCapture, extractMessageText, SpanTracker, type SessionReason } from "./tracker.js";
+import { extractMessageText, SpanTracker, type SessionReason } from "./tracker.js";
 
 /** Normalized shape of a pi-otel:log payload from another extension. */
 interface LogChannelPayload {
@@ -83,8 +83,10 @@ export default function (pi: ExtensionAPI): void {
   let runtime: TelemetryRuntime | null = null;
   let tracker: SpanTracker | null = null;
   let cfg = resolveConfig(process.cwd());
-  // captureContent is process-wide in the tracker module; mirror it.
-  configureCapture(cfg.captureContent);
+  /** Abort listener registered for the active turn; removed on turn_end. */
+  let abortCleanup: (() => void) | null = null;
+  /** True once we have logged an HTTP-level LLM error for the open request. */
+  let llmHttpErrorLogged = false;
 
   registerCommands(pi, () => runtime);
 
@@ -119,11 +121,17 @@ export default function (pi: ExtensionAPI): void {
     return f ? basename(f, ".jsonl") : undefined;
   };
 
+  const clearAbortListener = (): void => {
+    if (abortCleanup) {
+      abortCleanup();
+      abortCleanup = null;
+    }
+  };
+
   const start = async (ctx: ExtensionContext, reason?: SessionReason, parentId?: string): Promise<void> => {
     if (runtime) return; // idempotent
     // Re-resolve config with the session's cwd so project settings win.
     cfg = resolveConfig(ctx.cwd);
-    configureCapture(cfg.captureContent);
     if (!cfg.enabled) return;
     runtime = await startRuntime(cfg, { hasUI: ctx.hasUI });
     resetMetrics();
@@ -139,28 +147,22 @@ export default function (pi: ExtensionAPI): void {
     tracker.startSession(reason, parentId);
   };
 
-  const stop = async (reason: string): Promise<void> => {
+  const stop = async (_reason: string): Promise<void> => {
+    clearAbortListener();
     try {
       tracker?.endSession();
     } catch { /* best-effort */ }
     tracker = null;
     if (runtime) {
-      // Detach this runtime's signal handlers whether we shut down or only
-      // flush. Reload rebuilds the runtime on the next session_start and
-      // registers a fresh pair; leaving the old pair attached would stack a
-      // new set of SIGTERM/SIGHUP listeners on process every reload.
+      // Always shut down: batch processors and metric readers keep ticking
+      // after a bare flush. The next session_start builds a fresh runtime.
+      // removeProcessHooks runs inside shutdown; call it first so a slow
+      // shutdown cannot leave signal handlers stacked if start() races.
       runtime.removeProcessHooks();
-      // reload should flush (keep SDK for the next factory's spans); quit shuts down.
-      if (reason === "quit") {
-        await runtime.shutdown();
-      } else {
-        await runtime.flush();
-      }
+      await runtime.shutdown();
     }
-    // For non-quit reasons the runtime is rebuilt on next session_start.
-    // Drop the reference either way; start() will rebuild it.
     runtime = null;
-    void reason;
+    llmHttpErrorLogged = false;
   };
 
   // ----------------------------------------------------------------- events
@@ -243,26 +245,27 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("turn_start", async (event, ctx) => {
     lastCtx = ctx;
+    clearAbortListener();
     tracker?.startTurn(event.turnIndex);
-    // Wire abort -> cancellation marking on the active turn.
+    // Wire abort -> cancellation marking on the active turn. Remove on turn_end
+    // so multi-turn sessions do not stack listeners on a shared AbortSignal.
     const signal = ctx.signal;
     if (signal && !signal.aborted) {
-      signal.addEventListener(
-        "abort",
-        () => {
-          // Only count aborts that actually cancelled an in-flight turn, so
-          // mashing Esc outside a turn does not inflate the counter.
-          const cancelled = tracker?.markCancelled() ?? false;
-          if (cancelled) {
-            try { getMetrics(runtime?.meterProvider)?.turnCancellations.add(1); } catch { /* noop */ }
-          }
-        },
-        { once: true },
-      );
+      const onAbort = () => {
+        // Only count aborts that actually cancelled an in-flight turn, so
+        // mashing Esc outside a turn does not inflate the counter.
+        const cancelled = tracker?.markCancelled() ?? false;
+        if (cancelled) {
+          try { getMetrics(runtime?.meterProvider)?.turnCancellations.add(1); } catch { /* noop */ }
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      abortCleanup = () => signal.removeEventListener("abort", onAbort);
     }
   });
 
   pi.on("turn_end", async (event, _ctx) => {
+    clearAbortListener();
     const msg = event.message;
     if (msg && msg.role === "assistant") {
       // The LLM span is opened in before_provider_request and finalized here
@@ -270,7 +273,9 @@ export default function (pi: ExtensionAPI): void {
       tracker?.completeLlm(msg as MessageShapes.AssistantMessage);
       const finish = (msg as MessageShapes.AssistantMessage).stopReason;
       const errMsg = (msg as MessageShapes.AssistantMessage).errorMessage;
-      if (cfg.selfLogs && (finish === "error" || finish === "aborted")) {
+      // Skip a second log when after_provider_response already recorded the
+      // HTTP failure for this request.
+      if (cfg.selfLogs && (finish === "error" || finish === "aborted") && !llmHttpErrorLogged) {
         emitLog(
           runtime?.loggerProvider,
           "pi.llm_request.error",
@@ -280,10 +285,12 @@ export default function (pi: ExtensionAPI): void {
         );
       }
     }
+    llmHttpErrorLogged = false;
     tracker?.endTurn({ reason: "end" });
   });
 
   pi.on("before_provider_request", async (_event, ctx) => {
+    llmHttpErrorLogged = false;
     const model = ctx.model;
     tracker?.startLlm(model?.id, model?.provider);
   });
@@ -291,6 +298,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("after_provider_response", async (event, _ctx) => {
     tracker?.recordProviderResponse(event.status, event.headers ?? {});
     if (event.status >= 400 && cfg.selfLogs) {
+      llmHttpErrorLogged = true;
       emitLog(
         runtime?.loggerProvider,
         "pi.llm_request.error",
