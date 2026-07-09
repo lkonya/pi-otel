@@ -836,8 +836,6 @@ function prefixKeys(prefix: string, obj: Record<string, number | string>): Recor
   return out;
 }
 
-export type { MessageShapes };
-
 // ---------------------------------------------------------------------------
 // Structural message shapes.
 // These mirror @earendil-works/pi-ai's AssistantMessage / ToolCall / Usage.
@@ -846,7 +844,7 @@ export type { MessageShapes };
 // Keeping them structural also lets us tolerate minor field additions across
 // pi versions without a type error.
 // ---------------------------------------------------------------------------
-namespace MessageShapes {
+export namespace MessageShapes {
   export interface Usage {
     input: number;
     output: number;
@@ -866,11 +864,12 @@ namespace MessageShapes {
     name: string;
     arguments: Record<string, unknown> | string;
   }
+  export type ContentPart = TextPart | ToolCallPart | { type: "thinking" } | { type: "other" };
   export interface AssistantMessage {
     role: "assistant";
     // `content` is a discriminated union on `type`. The last member is a
     // catch-all for parts we don't model (thinking, redacted_thought, ...).
-    content: Array<TextPart | ToolCallPart | { type: "thinking" } | { type: "other" }>;
+    content: ContentPart[];
     model: string;
     responseModel?: string;
     responseId?: string;

@@ -7,7 +7,7 @@ import { BasicTracerProvider, BatchSpanProcessor, InMemorySpanExporter } from "@
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { SpanKind, type Tracer } from "@opentelemetry/api";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
-import { SpanTracker } from "../src/tracker.ts";
+import { SpanTracker, type MessageShapes } from "../src/tracker.ts";
 import type { Metrics } from "../src/metrics.ts";
 import type { ResolvedConfig } from "../src/config.ts";
 
@@ -142,8 +142,8 @@ export function asstMsg(opts: {
   responseModel?: string;
   responseId?: string;
   errorMessage?: string;
-}): unknown {
-  const content: Array<Record<string, unknown>> = [];
+}): MessageShapes.AssistantMessage {
+  const content: MessageShapes.ContentPart[] = [];
   if (opts.text !== undefined) content.push({ type: "text", text: opts.text });
   for (const tc of opts.toolCalls ?? []) {
     content.push({ type: "toolCall", id: tc.id, name: tc.name, arguments: tc.arguments ?? {} });

@@ -75,7 +75,7 @@ function runHappyPath(h: Harness, opts: { tool?: boolean } = {}): void {
     h.tracker.startTool("call_1", "bash", { command: "ls" });
     h.tracker.endTool("call_1", false, { output: "file.txt" });
   }
-  h.tracker.completeLlm(asstMsg({ text: "hi", stopReason: opts.tool ? "tool_use" : "stop" }) as never);
+  h.tracker.completeLlm(asstMsg({ text: "hi", stopReason: opts.tool ? "tool_use" : "stop" }));
   h.tracker.endTurn();
   h.tracker.endInteraction();
   h.tracker.endSession();
@@ -203,7 +203,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({
       input: 100, output: 50, cacheRead: 30, cacheWrite: 20, cacheWrite1h: 5, cost: 0.012,
       stopReason: "stop",
-    }) as never);
+    }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
@@ -222,7 +222,7 @@ describe("llm usage attribution", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("claude-4", "anthropic");
-    h.tracker.completeLlm(asstMsg({ cacheWrite: 10, stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ cacheWrite: 10, stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
@@ -235,7 +235,7 @@ describe("llm usage attribution", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("o-series", "openai");
-    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, reasoning: 42, stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, reasoning: 42, stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
@@ -247,7 +247,7 @@ describe("llm usage attribution", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
-    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
@@ -259,7 +259,7 @@ describe("llm usage attribution", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("claude-4-sonnet", "anthropic");
-    h.tracker.completeLlm(asstMsg({ responseModel: "claude-4-sonnet-20250514", stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ responseModel: "claude-4-sonnet-20250514", stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
@@ -272,7 +272,7 @@ describe("llm usage attribution", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
-    h.tracker.completeLlm(asstMsg({ stopReason: "end_turn" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "end_turn" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     assert.deepEqual(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_RESPONSE_FINISH_REASONS], ["end_turn"]);
@@ -283,7 +283,7 @@ describe("llm usage attribution", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
-    h.tracker.completeLlm(asstMsg({ stopReason: "error", errorMessage: "rate limited" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "error", errorMessage: "rate limited" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const span = h.spansByName()[SPAN_LLM_REQUEST];
@@ -297,7 +297,7 @@ describe("llm usage attribution", () => {
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
     h.tracker.recordProviderResponse(200, { "x-request-id": "from-header" });
-    h.tracker.completeLlm(asstMsg({ responseId: "from-message", stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ responseId: "from-message", stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     // message.responseId (set in completeLlm) overwrites the header-derived value.
@@ -310,7 +310,7 @@ describe("llm usage attribution", () => {
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
     h.tracker.recordProviderResponse(429, {});
-    h.tracker.completeLlm(asstMsg({ stopReason: "error" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "error" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
@@ -323,7 +323,7 @@ describe("llm usage attribution", () => {
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
     h.tracker.recordProviderResponse(500, {});
-    h.tracker.completeLlm(asstMsg({ stopReason: "error" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "error" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     const span = h.spansByName()[SPAN_LLM_REQUEST];
@@ -338,7 +338,7 @@ describe("llm metrics", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("claude-4", "anthropic");
-    h.tracker.completeLlm(asstMsg({ input: 100, output: 50, stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ input: 100, output: 50, stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     assert.ok(h.metrics.histograms["op"]?.length === 1, "op duration recorded");
     const tokenRecs = h.metrics.histograms["tokens"] ?? [];
@@ -361,7 +361,7 @@ describe("llm metrics", () => {
       cacheWrite1h: 4,
       reasoning: 7,
       stopReason: "stop",
-    }) as never);
+    }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     const byType = Object.fromEntries(
       (h.metrics.histograms["tokens"] ?? []).map(r => [r.attrs["gen_ai.token.type"], r.value]),
@@ -381,7 +381,7 @@ describe("llm metrics", () => {
     h.tracker.startLlm("m", "p");
     h.tracker.recordProviderResponse(429, {}); // attempt 1
     h.tracker.recordProviderResponse(200, {}); // attempt 2 -> retry
-    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     assert.equal(h.metrics.counters["retries"]?.length, 1, "one retry counted");
   });
@@ -437,7 +437,7 @@ describe("tool spans", () => {
     h.tracker.startLlm("claude-4", "anthropic");
     h.tracker.startTool("call_1", "bash", { command: "ls" });
     h.tracker.endTool("call_1", false, { output: "file.txt" });
-    h.tracker.completeLlm(asstMsg({ stopReason: "tool_use" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "tool_use" }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
@@ -497,7 +497,7 @@ describe("tool spans", () => {
     tracker.startLlm("m", "p");
     tracker.startTool("t1", "bash", { command: "ls" }); // must not throw
     tracker.endTool("t1", false, {});
-    tracker.completeLlm(asstMsg({ stopReason: "tool_use" }) as never);
+    tracker.completeLlm(asstMsg({ stopReason: "tool_use" }));
     tracker.endTurn();
     tracker.endInteraction();
     tracker.endSession();
@@ -519,7 +519,7 @@ describe("cancellation", () => {
     h.tracker.startTool("t1", "bash", {});
     h.tracker.markCancelled();
     h.tracker.endTool("t1", false, {});
-    h.tracker.endLlm({ reason: "cancel" } as never);
+    h.tracker.endLlm({ reason: "cancel" });
     h.tracker.endTurn({ cancelled: true });
     h.tracker.endInteraction({ cancelled: true });
     h.tracker.endSession();
@@ -565,7 +565,7 @@ describe("cancellation", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
-    h.tracker.completeLlm(asstMsg({ stopReason: "aborted" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "aborted" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_PI_CANCELLED], true);
@@ -678,7 +678,7 @@ describe("content capture modes", () => {
     h2.tracker.startLlm("m", "anthropic");
     h2.tracker.noteUserInput("the-prompt-secret");
     h2.tracker.noteToolResultInput("call_1", "bash", "the-tool-output-secret");
-    h2.tracker.completeLlm(asstMsg({ text: "the-completion-secret" }) as never);
+    h2.tracker.completeLlm(asstMsg({ text: "the-completion-secret" }));
     h2.tracker.endTurn();
     h2.tracker.endInteraction();
     h2.tracker.endSession();
@@ -722,7 +722,7 @@ describe("content capture modes", () => {
     h2.tracker.startLlm("m", "p");
     h2.tracker.startTool("t1", "bash", { command: "secret-cmd" });
     h2.tracker.endTool("t1", false, { out: "secret-out" });
-    h2.tracker.completeLlm(asstMsg({ text: "the-completion" }) as never);
+    h2.tracker.completeLlm(asstMsg({ text: "the-completion" }));
     h2.tracker.endTurn(); h2.tracker.endInteraction(); h2.tracker.endSession();
     await h2.flush();
     const spans = h2.spansByName();
@@ -749,7 +749,7 @@ describe("content capture modes", () => {
     h2.tracker.completeLlm(asstMsg({
       text: "the-completion",
       toolCalls: [{ id: "call_1", name: "bash", arguments: { command: "secret-cmd" } }],
-    }) as never);
+    }));
     h2.tracker.endTurn(); h2.tracker.endInteraction(); h2.tracker.endSession();
     await h2.flush();
     const llm = h2.spansByName()[SPAN_LLM_REQUEST];
@@ -775,7 +775,7 @@ describe("content capture modes", () => {
     h2.tracker.startLlm("m", "p");
     h2.tracker.startTool("t1", "bash", { command: "ls" });
     h2.tracker.endTool("t1", false, { out: "x" });
-    h2.tracker.completeLlm(asstMsg({}) as never);
+    h2.tracker.completeLlm(asstMsg({}));
     h2.tracker.endTurn(); h2.tracker.endInteraction(); h2.tracker.endSession();
     await h2.flush();
     const a = h2.spansByName()["pi.tool.bash"].attributes;
@@ -800,27 +800,38 @@ describe("defensive behavior", () => {
 
   test("completeLlm without a started llm span is a no-op", async () => {
     h.tracker.startSession();
-    h.tracker.completeLlm(asstMsg({ text: "x" }) as never); // no active llm
+    h.tracker.completeLlm(asstMsg({ text: "x" })); // no active llm
     h.tracker.endSession();
     await h.flush();
     assert.equal(h.spanExporter.getFinishedSpans().some(s => s.name === SPAN_LLM_REQUEST), false);
   });
 
   test("metrics failures never throw (best-effort)", async () => {
-    const bad = makeHarness();
-    // Replace metrics with one that throws on add/record.
-    (bad as unknown as { metrics: { toolCalls: { add: () => never } } }).metrics = {
+    const spanExporter = new InMemorySpanExporter();
+    const provider = new BasicTracerProvider({
+      resource: resourceFromAttributes({ "service.name": "pi-test" }),
+      spanProcessors: [new BatchSpanProcessor(spanExporter)],
+    });
+    const throwingMetrics = {
+      ...recordingMetricsOf(new RecordingMetrics()),
       toolCalls: { add: () => { throw new Error("metric boom"); } },
-    } as never;
-    bad.tracker.startSession();
-    bad.tracker.startInteraction("p");
-    bad.tracker.startTurn(0);
-    bad.tracker.startTool("t1", "bash", {});
-    assert.doesNotThrow(() => bad.tracker.endTool("t1", false, {}));
-    bad.tracker.endTurn(); bad.tracker.endInteraction(); bad.tracker.endSession();
-    await bad.flush();
-    // The span still ends despite the metric throw.
-    assert.ok(bad.spansByName()["pi.tool.bash"]);
+    } as ReturnType<typeof recordingMetricsOf>;
+    const tracker = new SpanTracker({
+      tracer: provider.getTracer("pi-otel-test", "0.0.0"),
+      captureContent: "full",
+      sessionId: () => "test-session",
+      sessionFile: () => "/tmp/test.jsonl",
+      cwd: "/test",
+      metrics: () => throwingMetrics,
+    });
+    tracker.startSession();
+    tracker.startInteraction("p");
+    tracker.startTurn(0);
+    tracker.startTool("t1", "bash", {});
+    assert.doesNotThrow(() => tracker.endTool("t1", false, {}));
+    tracker.endTurn(); tracker.endInteraction(); tracker.endSession();
+    await provider.forceFlush();
+    assert.ok(spanExporter.getFinishedSpans().some(s => s.name === "pi.tool.bash"));
   });
 });
 
@@ -830,7 +841,7 @@ describe("gen_ai.system provider", () => {
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "anthropic");
-    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
@@ -850,7 +861,7 @@ describe("pending input flush", () => {
     // message_start can fire before before_provider_request.
     h.tracker.noteUserInput("queued-before-llm");
     h.tracker.startLlm("m", "anthropic");
-    h.tracker.completeLlm(asstMsg({ text: "ok", stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ text: "ok", stopReason: "stop" }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
@@ -872,10 +883,10 @@ describe("session summary attributes", () => {
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
     h.tracker.recordProviderResponse(429, {});
-    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, cost: 0.01, stopReason: "error" }) as never);
+    h.tracker.completeLlm(asstMsg({ input: 10, output: 5, cost: 0.01, stopReason: "error" }));
     h.tracker.startTurn(1);
     h.tracker.startLlm("m", "p");
-    h.tracker.completeLlm(asstMsg({ input: 20, output: 15, cost: 0.02, stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ input: 20, output: 15, cost: 0.02, stopReason: "stop" }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
@@ -973,7 +984,7 @@ describe("time to completion", () => {
     h.tracker.startLlm("claude-4", "anthropic");
     h.tracker.noteLlmComplete({ role: "assistant" });
     h.tracker.noteLlmComplete({ role: "assistant" });
-    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
@@ -991,7 +1002,7 @@ describe("time to completion", () => {
     h.tracker.startTurn(0);
     h.tracker.startLlm("claude-4", "anthropic");
     h.tracker.noteLlmComplete({ role: "user" });
-    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
@@ -1011,7 +1022,7 @@ describe("time to first token", () => {
     h.tracker.startLlm("claude-4", "anthropic");
     h.tracker.noteFirstToken({ role: "assistant" });
     h.tracker.noteFirstToken({ role: "assistant" });
-    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "stop" }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
@@ -1056,7 +1067,7 @@ describe("error categorization", () => {
     h.tracker.startTurn(0);
     h.tracker.startLlm("m", "p");
     h.tracker.recordProviderResponse(status, {});
-    h.tracker.completeLlm(asstMsg({ stopReason: "error" }) as never);
+    h.tracker.completeLlm(asstMsg({ stopReason: "error" }));
     h.tracker.endTurn();
     h.tracker.endInteraction();
     h.tracker.endSession();
