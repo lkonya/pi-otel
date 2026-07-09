@@ -173,19 +173,19 @@ Sources, highest precedence first:
 
 Standard OTel, honored verbatim:
 
-`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER_ARG`, `OTEL_TRACES_EXPORT_INTERVAL`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_LOGS_EXPORT_INTERVAL`, and `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`. Metric temporality defaults to `DELTA` at startup when `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` is unset, so cumulative counters from a short-lived agent run do not mislead backends. Set the env var yourself to override.
+`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER_ARG`, `OTEL_TRACES_EXPORT_INTERVAL`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_LOGS_EXPORT_INTERVAL`, and `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`. Metric temporality defaults to `DELTA` when `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` is unset, so cumulative counters from a short-lived agent run do not mislead backends. The preference is passed to the metric exporter constructor; process.env is not mutated. Set the env var yourself to override.
 
 Extension-specific:
 
 `PI_OTEL_ENABLED`, `PI_OTEL_DISABLED`, `PI_OTEL_CAPTURE_CONTENT`, `PI_OTEL_SAMPLE_RATIO`, `PI_OTEL_TRACES`, `PI_OTEL_METRICS`, `PI_OTEL_LOGS`, `PI_OTEL_SELF_LOGS`, `PI_OTEL_DIAG_LOG_LEVEL`, `PI_OTEL_SHUTDOWN_TIMEOUT_MS`. Per-signal exporter env vars `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, and `OTEL_LOGS_EXPORTER` accept `otlp`, `console`, and `none` (comma-separated).
 
-Per-signal exporter tokens and the `DELTA` metric default are described above. `logsExportInterval` and `OTEL_LOGS_EXPORT_INTERVAL` resolve on config, but this SDK's `BatchLogRecordProcessor` has no export schedule knob: log records flush on batch fill, `forceFlush`, and shutdown.
+Per-signal exporter tokens and the `DELTA` metric default are described above. `tracesExportInterval` and `logsExportInterval` set each signal's batch processor `scheduledDelayMillis`. `metricExportInterval` sets the metric reader's export interval.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/otel-status` | Print the resolved config and export health: per-signal exporter lists, shutdown timeout, last error from each signal, last shutdown error, and counts of exported batches. |
+| `/otel-status` | Print the resolved config and export health: per-signal exporter lists, shutdown timeout, last error from each signal, last shutdown error, total spans exported, metric export batches, and total log records exported. |
 | `/otel-flush` | Force-flush pending telemetry to the backend. |
 | `/otel-test` | Emit one synthetic span, one metric, and one log record. Use it to verify the pipeline end to end. |
 
