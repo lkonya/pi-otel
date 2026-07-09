@@ -22,6 +22,7 @@ import type { SpanExporter } from "@opentelemetry/sdk-trace-base";
 import type { PushMetricExporter } from "@opentelemetry/sdk-metrics";
 import type { LogRecordExporter } from "@opentelemetry/sdk-logs";
 import { OTLPLogExporter as LogProtoExporter } from "@opentelemetry/exporter-logs-otlp-proto";
+import { AggregationTemporalityPreference } from "@opentelemetry/exporter-metrics-otlp-http";
 import { OTLPMetricExporter as MetricProtoExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
 import { OTLPTraceExporter as TraceProtoExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import {
@@ -69,8 +70,11 @@ export interface ExportHealth {
   metricsError?: string;
   logsError?: string;
   lastShutdownError?: string;
+  /** Total spans accepted by a successful export (sum of batch sizes). */
   spansExported: number;
+  /** Successful metric export calls (one ResourceMetrics payload each). */
   metricBatchesExported: number;
+  /** Total log records accepted by a successful export (sum of batch sizes). */
   logRecordsExported: number;
 }
 
@@ -100,6 +104,21 @@ export interface ExporterOpts {
   headers: Record<string, string>;
 }
 
+/**
+ * Resolve metric aggregation temporality without mutating process.env.
+ * Honors OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE when set; defaults
+ * to DELTA for short-lived agent processes (cumulative counters reset per run).
+ */
+export function resolveMetricTemporalityPreference(
+  env: NodeJS.ProcessEnv = process.env,
+): AggregationTemporalityPreference {
+  const raw = env.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE?.trim().toLowerCase();
+  if (raw === "cumulative") return AggregationTemporalityPreference.CUMULATIVE;
+  if (raw === "lowmemory") return AggregationTemporalityPreference.LOWMEMORY;
+  // unset, "delta", or unknown -> DELTA (agent-friendly default)
+  return AggregationTemporalityPreference.DELTA;
+}
+
 async function newTraceExporter(p: Protocol, o: ExporterOpts): Promise<SpanExporter> {
   if (p === "grpc") {
     const { OTLPTraceExporter } = await import("@opentelemetry/exporter-trace-otlp-grpc");
@@ -112,15 +131,16 @@ async function newTraceExporter(p: Protocol, o: ExporterOpts): Promise<SpanExpor
   return new TraceProtoExporter(o);
 }
 async function newMetricExporter(p: Protocol, o: ExporterOpts): Promise<PushMetricExporter> {
+  const opts = { ...o, temporalityPreference: resolveMetricTemporalityPreference() };
   if (p === "grpc") {
     const { OTLPMetricExporter } = await import("@opentelemetry/exporter-metrics-otlp-grpc");
-    return new OTLPMetricExporter(o);
+    return new OTLPMetricExporter(opts);
   }
   if (p === "http/json") {
     const { OTLPMetricExporter } = await import("@opentelemetry/exporter-metrics-otlp-http");
-    return new OTLPMetricExporter(o);
+    return new OTLPMetricExporter(opts);
   }
-  return new MetricProtoExporter(o);
+  return new MetricProtoExporter(opts);
 }
 async function newLogExporter(p: Protocol, o: ExporterOpts): Promise<LogRecordExporter> {
   if (p === "grpc") {
@@ -141,16 +161,26 @@ interface ExportResult {
 }
 type ExportFn = (items: unknown, cb: (r: ExportResult) => void) => void;
 
+/** Count items in a trace/log export payload. Metric payloads are not arrays. */
+function exportItemCount(items: unknown): number {
+  return Array.isArray(items) ? items.length : 0;
+}
+
 /**
  * Wrap an exporter's export() so the last failure is captured for /otel-status
  * without propagating the error (exporters already retry internally).
+ * onResult receives the number of items in the batch on success (0 for metrics).
  */
-function trackHealth<T>(exporter: T, onResult: (ok: boolean, errMsg?: string) => void): T {
+function trackHealth<T>(
+  exporter: T,
+  onResult: (ok: boolean, itemCount: number, errMsg?: string) => void,
+): T {
   const orig = (exporter as unknown as { export: ExportFn }).export.bind(exporter) as ExportFn;
   (exporter as unknown as { export: ExportFn }).export = ((items: unknown, cb: (r: ExportResult) => void) => {
+    const count = exportItemCount(items);
     orig(items, (result) => {
-      if (result.code === 0) onResult(true);
-      else onResult(false, result.error?.message ?? "export failed");
+      if (result.code === 0) onResult(true, count);
+      else onResult(false, count, result.error?.message ?? "export failed");
       cb(result);
     });
   }) as ExportFn;
@@ -253,12 +283,6 @@ export async function startRuntime(
 
   const resource = await buildResource(cfg);
 
-  // Short-lived agent process: cumulative counters would reset on every run and
-  // mislead backends. Default to delta unless the operator explicitly set one.
-  if (process.env.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE === undefined) {
-    process.env.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE = "DELTA";
-  }
-
   // --- Traces ---
   let traceProvider: BasicTracerProvider | undefined;
   if (cfg.enabled && cfg.traces.enabled) {
@@ -270,8 +294,8 @@ export async function startRuntime(
         if (token === "otlp") {
           const exporter = trackHealth(
             await newTraceExporter(cfg.protocol, { url: cfg.tracesEndpoint, headers: cfg.headers }),
-            (ok, err) => {
-              if (ok) { health.spansExported++; health.tracesError = undefined; }
+            (ok, count, err) => {
+              if (ok) { health.spansExported += count; health.tracesError = undefined; }
               else { health.tracesError = err; }
             },
           );
@@ -306,7 +330,7 @@ export async function startRuntime(
         if (token === "otlp") {
           const exporter = trackHealth(
             await newMetricExporter(cfg.protocol, { url: cfg.metricsEndpoint, headers: cfg.headers }),
-            (ok, err) => {
+            (ok, _count, err) => {
               if (ok) { health.metricBatchesExported++; health.metricsError = undefined; }
               else { health.metricsError = err; }
             },
@@ -340,13 +364,14 @@ export async function startRuntime(
         if (token === "otlp") {
           const exporter = trackHealth(
             await newLogExporter(cfg.protocol, { url: cfg.logsEndpoint, headers: cfg.headers }),
-            (ok, err) => {
-              if (ok) { health.logRecordsExported++; health.logsError = undefined; }
+            (ok, count, err) => {
+              if (ok) { health.logRecordsExported += count; health.logsError = undefined; }
               else { health.logsError = err; }
             },
           );
-          // logsExportInterval is resolved on cfg but BatchLogRecordProcessor has no schedule knob in this SDK version; logs flush on batch-fill, forceFlush, and shutdown.
-          processors.push(new BatchLogRecordProcessor(exporter));
+          processors.push(
+            new BatchLogRecordProcessor(exporter, { scheduledDelayMillis: cfg.logsExportInterval }),
+          );
         } else if (token === "console") {
           processors.push(new SimpleLogRecordProcessor(new ConsoleLogRecordExporter()));
         }

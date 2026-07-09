@@ -11,7 +11,14 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import { InMemoryLogRecordExporter } from "@opentelemetry/sdk-logs";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import { shutdownProviders, startRuntime, detectHostId, type ExportHealth } from "../src/sdk.ts";
+import {
+  shutdownProviders,
+  startRuntime,
+  detectHostId,
+  resolveMetricTemporalityPreference,
+  type ExportHealth,
+} from "../src/sdk.ts";
+import { AggregationTemporalityPreference } from "@opentelemetry/exporter-metrics-otlp-http";
 import { resolveConfig } from "../src/config.ts";
 
 /**
@@ -272,17 +279,21 @@ describe("per-signal exporters", () => {
     }
   });
 
-  test("delta temporality env defaulted when unset", async () => {
+  test("startRuntime does not mutate OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", async () => {
     delete process.env.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE;
     const rt = await startRuntime(cfg());
     try {
-      assert.equal(process.env.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE, "DELTA");
+      assert.equal(
+        process.env.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE,
+        undefined,
+        "process.env must stay untouched",
+      );
     } finally {
       await rt.shutdown();
     }
   });
 
-  test("delta temporality env not overwritten when preset", async () => {
+  test("startRuntime leaves a preset temporality env value alone", async () => {
     process.env.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE = "CUMULATIVE";
     const rt = await startRuntime(cfg());
     try {
@@ -290,6 +301,47 @@ describe("per-signal exporters", () => {
     } finally {
       await rt.shutdown();
     }
+  });
+
+  test("logsExportInterval is passed to BatchLogRecordProcessor", async () => {
+    const rt = await startRuntime(cfg({ logsExportInterval: 1234 }));
+    try {
+      assert.ok(rt.loggerProvider, "logger provider present");
+      // Walk the provider's shared state to the first batch processor's delay.
+      const shared = (rt.loggerProvider as unknown as {
+        _sharedState: {
+          processors: Array<{ _scheduledDelayMillis?: number }>;
+        };
+      })._sharedState;
+      const delay = shared.processors[0]?._scheduledDelayMillis;
+      assert.equal(delay, 1234, "scheduledDelayMillis must match logsExportInterval");
+    } finally {
+      await rt.shutdown();
+    }
+  });
+});
+
+describe("resolveMetricTemporalityPreference", () => {
+  test("defaults to DELTA when unset", () => {
+    assert.equal(resolveMetricTemporalityPreference({}), AggregationTemporalityPreference.DELTA);
+  });
+
+  test("honors cumulative and lowmemory", () => {
+    assert.equal(
+      resolveMetricTemporalityPreference({ OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "cumulative" }),
+      AggregationTemporalityPreference.CUMULATIVE,
+    );
+    assert.equal(
+      resolveMetricTemporalityPreference({ OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "LOWMEMORY" }),
+      AggregationTemporalityPreference.LOWMEMORY,
+    );
+  });
+
+  test("unknown values fall back to DELTA", () => {
+    assert.equal(
+      resolveMetricTemporalityPreference({ OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "nope" }),
+      AggregationTemporalityPreference.DELTA,
+    );
   });
 });
 
