@@ -150,6 +150,27 @@ function envNum(names: string[], fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/** Minimum batch/metric export interval (ms). Blocks 0/negative tight-loop configs. */
+export const MIN_EXPORT_INTERVAL_MS = 100;
+
+/**
+ * Clamp a resolved export-interval value. Non-finite values fall back to
+ * `defaultMs`. Values below MIN_EXPORT_INTERVAL_MS are raised to that floor.
+ */
+export function clampExportIntervalMs(n: number, defaultMs: number): number {
+  if (!Number.isFinite(n)) return defaultMs;
+  return Math.max(MIN_EXPORT_INTERVAL_MS, Math.trunc(n));
+}
+
+/**
+ * Clamp shutdown timeout. Non-finite falls back to `defaultMs`. Negatives
+ * become 0 (immediate timeout); 0 is allowed so operators can skip waiting.
+ */
+export function clampShutdownTimeoutMs(n: number, defaultMs: number): number {
+  if (!Number.isFinite(n)) return defaultMs;
+  return Math.max(0, Math.trunc(n));
+}
+
 const EXPORTER_TOKENS: ReadonlySet<string> = new Set(["otlp", "console", "none"]);
 
 function dedupeValidExporterParts(parts: string[]): ExporterToken[] {
@@ -295,7 +316,10 @@ export function resolveConfig(cwd: string): ResolvedConfig {
     },
     captureContent: normalizeCapture(envStr("PI_OTEL_CAPTURE_CONTENT") ?? s.captureContent),
     sampleRatio,
-    metricExportInterval: envNum(["OTEL_METRIC_EXPORT_INTERVAL", "PI_OTEL_METRIC_EXPORT_INTERVAL"], s.metricExportInterval ?? 10000),
+    metricExportInterval: clampExportIntervalMs(
+      envNum(["OTEL_METRIC_EXPORT_INTERVAL", "PI_OTEL_METRIC_EXPORT_INTERVAL"], s.metricExportInterval ?? 10000),
+      10000,
+    ),
     tracesExporters: parseExporters(
       process.env.OTEL_TRACES_EXPORTER,
       parseExporterTokensFromArray(s.tracesExporters, ["otlp"]),
@@ -308,14 +332,23 @@ export function resolveConfig(cwd: string): ResolvedConfig {
       process.env.OTEL_LOGS_EXPORTER,
       parseExporterTokensFromArray(s.logsExporters, ["otlp"]),
     ),
-    tracesExportInterval: envNum(["OTEL_TRACES_EXPORT_INTERVAL"], s.tracesExportInterval ?? 5000),
-    logsExportInterval: envNum(["OTEL_LOGS_EXPORT_INTERVAL"], s.logsExportInterval ?? 5000),
+    tracesExportInterval: clampExportIntervalMs(
+      envNum(["OTEL_TRACES_EXPORT_INTERVAL"], s.tracesExportInterval ?? 5000),
+      5000,
+    ),
+    logsExportInterval: clampExportIntervalMs(
+      envNum(["OTEL_LOGS_EXPORT_INTERVAL"], s.logsExportInterval ?? 5000),
+      5000,
+    ),
     traces: { enabled: envBool(["PI_OTEL_TRACES"], s.traces ?? true) },
     metrics: { enabled: envBool(["PI_OTEL_METRICS"], s.metrics ?? true) },
     logs: { enabled: envBool(["PI_OTEL_LOGS"], s.logs ?? true) },
     diagLogLevel: normalizeDiag(envStr("OTEL_LOG_LEVEL", "PI_OTEL_DIAG_LOG_LEVEL") ?? s.diagLogLevel),
     selfLogs: envBool(["PI_OTEL_SELF_LOGS"], s.selfLogs ?? true),
-    shutdownTimeoutMs: envNum(["PI_OTEL_SHUTDOWN_TIMEOUT_MS"], s.shutdownTimeoutMs ?? 2000),
+    shutdownTimeoutMs: clampShutdownTimeoutMs(
+      envNum(["PI_OTEL_SHUTDOWN_TIMEOUT_MS"], s.shutdownTimeoutMs ?? 2000),
+      2000,
+    ),
     cwd,
   };
 }

@@ -5,6 +5,9 @@ import {
   resolveSignalEndpoint,
   parseExporters,
   parseExporterTokensFromArray,
+  clampExportIntervalMs,
+  clampShutdownTimeoutMs,
+  MIN_EXPORT_INTERVAL_MS,
 } from "../src/config.ts";
 
 /**
@@ -40,6 +43,8 @@ const ENV_KEYS = [
   "PI_OTEL_METRICS",
   "PI_OTEL_LOGS",
   "PI_OTEL_SERVICE_NAME",
+  "PI_OTEL_SHUTDOWN_TIMEOUT_MS",
+  "PI_OTEL_METRIC_EXPORT_INTERVAL",
 ] as const;
 
 let saved: Record<string, string | undefined> = {};
@@ -375,6 +380,50 @@ describe("export intervals", () => {
   test("OTEL_LOGS_EXPORT_INTERVAL non-numeric falls back", () => {
     process.env.OTEL_LOGS_EXPORT_INTERVAL = "abc";
     assert.equal(resolveConfig("/nonexistent").logsExportInterval, 5000);
+  });
+
+  test("zero and negative export intervals clamp to the minimum", () => {
+    process.env.OTEL_METRIC_EXPORT_INTERVAL = "0";
+    process.env.OTEL_TRACES_EXPORT_INTERVAL = "-50";
+    process.env.OTEL_LOGS_EXPORT_INTERVAL = "1";
+    const c = resolveConfig("/nonexistent");
+    assert.equal(c.metricExportInterval, MIN_EXPORT_INTERVAL_MS);
+    assert.equal(c.tracesExportInterval, MIN_EXPORT_INTERVAL_MS);
+    assert.equal(c.logsExportInterval, MIN_EXPORT_INTERVAL_MS);
+  });
+
+  test("fractional export intervals truncate toward the floor after clamp", () => {
+    process.env.OTEL_TRACES_EXPORT_INTERVAL = "1500.9";
+    assert.equal(resolveConfig("/nonexistent").tracesExportInterval, 1500);
+  });
+
+  test("shutdown timeout allows 0 and clamps negatives to 0", () => {
+    process.env.PI_OTEL_SHUTDOWN_TIMEOUT_MS = "0";
+    assert.equal(resolveConfig("/nonexistent").shutdownTimeoutMs, 0);
+    process.env.PI_OTEL_SHUTDOWN_TIMEOUT_MS = "-10";
+    assert.equal(resolveConfig("/nonexistent").shutdownTimeoutMs, 0);
+  });
+
+  test("shutdown timeout non-numeric falls back to default", () => {
+    process.env.PI_OTEL_SHUTDOWN_TIMEOUT_MS = "nope";
+    assert.equal(resolveConfig("/nonexistent").shutdownTimeoutMs, 2000);
+  });
+});
+
+describe("clamp helpers", () => {
+  test("clampExportIntervalMs floors and rejects non-finite", () => {
+    assert.equal(clampExportIntervalMs(0, 5000), MIN_EXPORT_INTERVAL_MS);
+    assert.equal(clampExportIntervalMs(-1, 5000), MIN_EXPORT_INTERVAL_MS);
+    assert.equal(clampExportIntervalMs(250, 5000), 250);
+    assert.equal(clampExportIntervalMs(Number.NaN, 5000), 5000);
+    assert.equal(clampExportIntervalMs(Number.POSITIVE_INFINITY, 5000), 5000);
+  });
+
+  test("clampShutdownTimeoutMs allows zero", () => {
+    assert.equal(clampShutdownTimeoutMs(0, 2000), 0);
+    assert.equal(clampShutdownTimeoutMs(-5, 2000), 0);
+    assert.equal(clampShutdownTimeoutMs(1500, 2000), 1500);
+    assert.equal(clampShutdownTimeoutMs(Number.NaN, 2000), 2000);
   });
 });
 
