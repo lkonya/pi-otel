@@ -13,7 +13,6 @@
 import type { Logger } from "@opentelemetry/api-logs";
 import { SeverityNumber, type LogAttributes } from "@opentelemetry/api-logs";
 import type { LoggerProvider } from "@opentelemetry/sdk-logs";
-import type { ContentCapture } from "./attrs.js";
 import { extensionVersion } from "./version.js";
 
 const LOGGER_NAME = "pi-otel";
@@ -68,20 +67,4 @@ export function emitLog(
   } catch {
     // best-effort
   }
-}
-
-// ---------------------------------------------------------------------------
-// Content capture helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Decide whether raw content should be attached for a given surface.
- * - prompts/completions: shown when captureContent is `no_tool_content` or `full`.
- * - tool args/results:    shown only when captureContent is `full`.
- */
-export function shouldCapturePrompt(c: ContentCapture): boolean {
-  return c === "no_tool_content" || c === "full";
-}
-export function shouldCaptureToolContent(c: ContentCapture): boolean {
-  return c === "full";
 }

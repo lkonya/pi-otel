@@ -17,7 +17,10 @@ import { createHash } from "node:crypto";
 // gen_ai.* (GenAI semantic conventions)
 // ---------------------------------------------------------------------------
 
-/** Agent harness identity (pi), not an AI vendor. Do not use as `gen_ai.system` on spans. */
+/**
+ * Agent harness identity for `gen_ai.agent.name`.
+ * Not an AI vendor; do not write this value to `gen_ai.system` (that holds the provider).
+ */
 export const GEN_AI_SYSTEM = "pi";
 
 export const ATTR_GEN_AI_SYSTEM = "gen_ai.system";
