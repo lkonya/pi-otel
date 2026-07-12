@@ -2,11 +2,11 @@
 
 OpenTelemetry traces, metrics, and logs for the [pi coding agent](https://github.com/earendil-works/pi).
 
-The extension is a pure OTLP exporter. It speaks the OpenTelemetry wire protocol and emits strict semantic conventions (`gen_ai.*`, `service.*`, `process.*`, `host.*`). Point it at a hosted platform, a collector, or a local dev backend. Whatever you point it at does any translation it needs.
+The extension is a pure OTLP exporter. It speaks the OpenTelemetry wire protocol and emits strict semantic conventions (`gen_ai.*`, `service.*`, `process.*`, `host.*`). Point it at a hosted platform, a collector, or a local dev backend.
 
 ## What it emits
 
-All three signals are on by default: traces, metrics, and OTLP logs.
+All three signals are on by default: traces, metrics, and logs.
 
 **Span tree:**
 
@@ -38,7 +38,7 @@ Token usage uses a histogram. The semconv is explicit about this. Histograms let
 
 ## Capabilities
 
-**Works with every OTLP backend.** Point the extension at a hosted platform, a self-hosted collector, or a local dev backend. It emits standard OTLP and strict semantic conventions, so the backend does any translation it needs. Auth is standard `OTEL_EXPORTER_OTLP_HEADERS`.
+**Works with every OTLP backend.** The export is standard OTLP with strict semantic conventions, so any receiver, hosted or self-hosted, consumes it and handles its own translation. Auth is the standard `OTEL_EXPORTER_OTLP_HEADERS`.
 
 **Speaks GenAI semantic conventions natively.** LLM spans carry the full `gen_ai.*` attribute set: token usage by type, cost, request and response model, response id, finish reasons, tool call id, name, arguments, and result, plus `gen_ai.input.messages` and `gen_ai.output.messages` JSON for AI panels. `gen_ai.system` carries the real provider (`anthropic`, `openai`, `zai`, etc.) so backends group by vendor correctly. `gen_ai.agent.name` is `pi`, the agent harness. Backends that read GenAI semconv render your agent traces as model calls with no extra setup on their side.
 
@@ -62,7 +62,7 @@ Token usage uses a histogram. The semconv is explicit about this. Histograms let
 
 **Picks an exporter per signal.** `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, and `OTEL_LOGS_EXPORTER` accept comma-separated `otlp` (default), `console`, and `none`. Unknown tokens drop. `none` alone disables that signal. `otlp,console` mirrors to stdout for debugging in print and rpc modes. Console strips out when pi runs in TUI mode so JSON does not corrupt the display.
 
-**Tracks Pi's full lifecycle.** Spans for sessions, prompts, turns, LLM requests, and tool calls. Each session span ends with a summary: total input and output tokens, total cost, and an error count, so one row shows the whole session's spend at a glance. Each interaction carries a one-way hash of the assembled system prompt (`gen_ai.system.prompt.hash`) so backends can group sessions by prompt template and A/B iterations without the prompt text leaving the machine. Log records for session start and end, compaction, model changes, user bash commands, and tool and LLM errors. Metrics for operation duration, time to first token, time to completion, token usage, tool calls, session duration, prompts, turns, provider retries, cancellations, and compactions.
+**Session-level summaries and prompt fingerprinting.** Each session span ends with a summary: total input and output tokens, total cost, and an error count, so one row shows the whole session's spend at a glance. Each interaction carries a one-way hash of the assembled system prompt (`gen_ai.system.prompt.hash`) so backends can group sessions by prompt template and A/B iterations without the prompt text leaving the machine.
 
 **Dial content capture per project.** `captureContent` defaults to `full` and ships prompts, completions, and tool input and output to your backend, clamped to 64 KiB per attribute to fit collector limits. Drop to `no_tool_content` to keep prompts but hash tool input and output, the surface where secrets flow. Drop to `metadata_only` to emit only byte counts, line counts, and a hash, with no raw payloads leaving the machine. The hashes still let you correlate and dedupe across sessions without exfiltrating the underlying text. Three modes, no code changes.
 
