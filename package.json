@@ -39,7 +39,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --import jiti/register --test --test-reporter=spec test/*.test.ts",
-    "test:fast": "node --import jiti/register --test test/*.test.ts"
+    "test:fast": "node --import jiti/register --test test/*.test.ts",
+    "coverage": "node --import jiti/register --test --experimental-test-coverage test/*.test.ts"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
