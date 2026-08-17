@@ -168,6 +168,12 @@ export class SpanTracker {
     cacheWrite1hTokens?: number;
     httpStatus?: number;
     attempts: number;
+    /** Failed HTTP attempts seen so far (reset never; recovery clears lastError*). */
+    failedAttempts: number;
+    /** Category of the most recent failed attempt; cleared by a successful one. */
+    lastErrorType?: string;
+    /** HTTP status of the most recent failed attempt. */
+    lastErrorStatus?: number;
     inputMessages: Array<Record<string, unknown>>;
     firstTokenSeen?: boolean;
     completionRecorded?: boolean;
@@ -292,6 +298,7 @@ export class SpanTracker {
     // LLM span.
     if (this.llm && this.llm.startMs < cutoff) {
       this.llm.span.setAttribute(ATTR_PI_ORPHANED, true);
+      this.applyLlmErrorState(this.llm.span);
       this.llm.span.end();
       this.llm = null;
     }
@@ -411,6 +418,7 @@ export class SpanTracker {
       requestModel,
       providerSystem,
       attempts: 0,
+      failedAttempts: 0,
       inputMessages: [],
     };
     // Drain any user/tool messages that arrived before the LLM span opened.
@@ -513,11 +521,36 @@ export class SpanTracker {
       } catch { /* noop */ }
     }
     if (status >= 400) {
-      this.errorCount++;
-      this.llm.span.setAttribute(ATTR_ERROR_TYPE, categorizeHttpError(status));
-      this.llm.span.setStatus({ code: SpanStatusCode.ERROR, message: `HTTP ${status}` });
+      // Track the failure on the slot, never on the span. Span attributes
+      // cannot be removed once set (setAttribute ignores null/undefined), so
+      // stamping an attempt-scoped error here would survive a successful
+      // retry and misreport the request. The final outcome is applied once
+      // at span finalization (applyLlmErrorState).
+      this.llm.failedAttempts++;
+      this.llm.lastErrorType = categorizeHttpError(status);
+      this.llm.lastErrorStatus = status;
+    } else if (this.llm.lastErrorType !== undefined) {
+      // A retry succeeded: the request as a whole did not fail.
+      this.llm.lastErrorType = undefined;
+      this.llm.lastErrorStatus = undefined;
     }
     return retry;
+  }
+
+  /**
+   * Stamp the final provider outcome on an LLM span. Called once at span
+   * finalization (completeLlm error path, endLlm, orphan sweep): a failed
+   * attempt that a retry recovered leaves no markers, while a request whose
+   * final attempt failed keeps its error.type and ERROR status.
+   */
+  private applyLlmErrorState(span: Span): void {
+    const slot = this.llm;
+    if (!slot?.lastErrorType) return;
+    span.setAttribute(ATTR_ERROR_TYPE, slot.lastErrorType);
+    span.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: slot.lastErrorStatus !== undefined ? `HTTP ${slot.lastErrorStatus}` : "provider error",
+    });
   }
 
   /** Finalize the LLM span from the completed AssistantMessage. */
@@ -541,10 +574,18 @@ export class SpanTracker {
       if (message.errorMessage) {
         llm.span.setAttribute(ATTR_EXCEPTION_MESSAGE, message.errorMessage);
       }
+      // Stamp the final attempt's HTTP category (when one was seen) before
+      // the status below overrides the message with the provider's own text.
+      this.applyLlmErrorState(llm.span);
       llm.span.setStatus({
         code: SpanStatusCode.ERROR,
         message: message.errorMessage ?? finish,
       });
+      if (finish === "error") {
+        // One session error per failed request. Retries that recovered do
+        // not count (recordProviderResponse stopped counting per attempt).
+        this.errorCount++;
+      }
     }
     llm.span.end();
     this.llm = null;
@@ -556,6 +597,7 @@ export class SpanTracker {
     if (opts.cancelled) llm.span.setAttribute(ATTR_PI_CANCELLED, true);
     else if (opts.reason !== "end") llm.span.setAttribute(ATTR_PI_ORPHANED, true);
     this.setStatusFromError(llm.span, opts.error);
+    this.applyLlmErrorState(llm.span);
     llm.span.end();
     this.llm = null;
   }

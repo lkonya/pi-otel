@@ -397,6 +397,64 @@ describe("llm metrics", () => {
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     assert.equal(h.metrics.counters["retries"]?.length, 1, "one retry counted");
   });
+
+  test("a retry that succeeds leaves no error markers on the span", async () => {
+    // Regression: a 429 followed by a 200 used to stamp error.type and ERROR
+    // status at the failed attempt and never clear them, so a request that
+    // succeeded on retry exported as a failure and counted a session error.
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.recordProviderResponse(429, {});
+    h.tracker.recordProviderResponse(200, {});
+    h.tracker.completeLlm(asstMsg({ text: "ok", stopReason: "stop" }));
+    h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
+    await h.flush();
+    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    assert.equal(llm.attributes["error.type"], undefined, "no error.type after recovery");
+    assert.equal(llm.status.code, SpanStatusCode.UNSET, "status stays UNSET after recovery");
+    assert.equal(
+      h.spansByName()[SPAN_SESSION].attributes[ATTR_PI_ERROR_COUNT],
+      undefined,
+      "no session error counted",
+    );
+  });
+
+  test("a request whose final attempt fails marks error.type once and counts one error", async () => {
+    // Two failed attempts (429 then 500) then a hard error message: the span
+    // keeps the final attempt's category and the session counts one error,
+    // not one per failed attempt.
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.recordProviderResponse(429, {});
+    h.tracker.recordProviderResponse(500, {});
+    h.tracker.completeLlm(asstMsg({ stopReason: "error", errorMessage: "HTTP 500" }));
+    h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
+    await h.flush();
+    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    assert.equal(llm.attributes["error.type"], "server_error", "final attempt's category wins");
+    assert.equal(llm.status.code, SpanStatusCode.ERROR);
+    assert.equal(h.spansByName()[SPAN_SESSION].attributes[ATTR_PI_ERROR_COUNT], 1);
+  });
+
+  test("a defensively closed failed request keeps its error markers", async () => {
+    // endLlm path (session replaced mid-request): the final failed attempt
+    // still surfaces on the span even though completeLlm never ran.
+    h.tracker.startSession();
+    h.tracker.startInteraction("p");
+    h.tracker.startTurn(0);
+    h.tracker.startLlm("m", "p");
+    h.tracker.recordProviderResponse(503, {});
+    h.tracker.endInteraction({ reason: "session_switch" });
+    h.tracker.endSession();
+    await h.flush();
+    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    assert.equal(llm.attributes["error.type"], "server_error");
+    assert.equal(llm.status.code, SpanStatusCode.ERROR);
+  });
 });
 
 // ---------------------------------------------------------------------------
