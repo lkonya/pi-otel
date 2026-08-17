@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { trace, metrics, diag } from "@opentelemetry/api";
+import { trace, metrics, diag, DiagLogLevel } from "@opentelemetry/api";
 import { logs as logsApi } from "@opentelemetry/api-logs";
 import {
   BasicTracerProvider,
@@ -229,6 +229,46 @@ describe("resource", () => {
     } finally {
       await rt.shutdown();
     }
+  });
+});
+
+describe("diag routing", () => {
+  const silence = () =>
+    diag.setLogger(
+      { verbose() {}, debug() {}, info() {}, warn() {}, error() {} },
+      { logLevel: DiagLogLevel.NONE, suppressOverrideMessage: true },
+    );
+
+  test("diagLogLevel WARN routes warn to stderr and filters debug", async () => {
+    const lines: string[] = [];
+    const orig = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.join(" ")); };
+    try {
+      const rt = await startRuntime(cfg({ diagLogLevel: DiagLogLevel.WARN }));
+      diag.warn("warned-through");
+      diag.debug("debug-filtered");
+      await rt.shutdown();
+    } finally {
+      console.error = orig;
+      silence();
+    }
+    assert.ok(lines.some((l) => l.includes("warned-through")), "warn reaches stderr");
+    assert.ok(!lines.some((l) => l.includes("debug-filtered")), "debug filtered by level");
+  });
+
+  test("default diagLogLevel NONE emits nothing", async () => {
+    const lines: string[] = [];
+    const orig = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.join(" ")); };
+    try {
+      const rt = await startRuntime(cfg());
+      diag.error("error-suppressed");
+      await rt.shutdown();
+    } finally {
+      console.error = orig;
+      silence();
+    }
+    assert.equal(lines.length, 0, "no diag output at NONE");
   });
 });
 

@@ -282,8 +282,10 @@ export async function startRuntime(
     logRecordsExported: 0,
   };
 
-  // diag is the only global we touch. Default NONE.
-  diag.setLogger(noopDiagLogger(), {
+  // diag is the only global we touch. Default NONE. Diagnostics go to
+  // stderr: stdout belongs to the TUI renderer in interactive mode, and a
+  // diag line on it would corrupt the display.
+  diag.setLogger(stderrDiagLogger(), {
     logLevel: cfg.diagLogLevel,
     suppressOverrideMessage: true,
   });
@@ -498,10 +500,11 @@ function timeoutAfter(ms: number, message: string): Promise<never> {
   });
 }
 
-/** A diag logger that drops everything by default. */
-function noopDiagLogger(): DiagLogger {
-  const noop = () => {};
-  return { verbose: noop, debug: noop, info: noop, warn: noop, error: noop };
+/** A diag logger that writes every accepted message to stderr. diag's own
+ * level filter (set at setLogger time) decides what reaches it. */
+function stderrDiagLogger(): DiagLogger {
+  const write = (message: string) => console.error(message);
+  return { verbose: write, debug: write, info: write, warn: write, error: write };
 }
 
 function noopTracer(): Tracer {
