@@ -45,6 +45,20 @@ const ENV_KEYS = [
   "PI_OTEL_SERVICE_NAME",
   "PI_OTEL_SHUTDOWN_TIMEOUT_MS",
   "PI_OTEL_METRIC_EXPORT_INTERVAL",
+  "OTEL_SDK_DISABLED",
+  "OTEL_TRACES_SAMPLER",
+  "OTEL_EXPORTER_OTLP_TIMEOUT",
+  "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+  "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+  "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+  "OTEL_BSP_SCHEDULE_DELAY",
+  "OTEL_BSP_MAX_QUEUE_SIZE",
+  "OTEL_BSP_MAX_EXPORT_BATCH_SIZE",
+  "OTEL_BSP_EXPORT_TIMEOUT",
+  "OTEL_BLP_SCHEDULE_DELAY",
+  "OTEL_BLP_MAX_QUEUE_SIZE",
+  "OTEL_BLP_MAX_EXPORT_BATCH_SIZE",
+  "OTEL_BLP_EXPORT_TIMEOUT",
 ] as const;
 
 let saved: Record<string, string | undefined> = {};
@@ -517,3 +531,111 @@ function mkProjectSettings(contents: Record<string, unknown>): string {
   fs.writeFileSync(node_path.join(dir, ".pi", "settings.json"), JSON.stringify(contents));
   return dir;
 }
+
+// --- standard OTel SDK env vars ---------------------------------------------
+
+describe("OTEL_SDK_DISABLED", () => {
+  test("true disables even with PI_OTEL_ENABLED=true", () => {
+    process.env.OTEL_SDK_DISABLED = "true";
+    process.env.PI_OTEL_ENABLED = "true";
+    assert.equal(resolveConfig("/nonexistent").enabled, false);
+  });
+
+  test("false does not disable", () => {
+    process.env.OTEL_SDK_DISABLED = "false";
+    assert.equal(resolveConfig("/nonexistent").enabled, true);
+  });
+
+  test("PI_OTEL_DISABLED still wins over enable flags", () => {
+    process.env.PI_OTEL_DISABLED = "1";
+    process.env.PI_OTEL_ENABLED = "true";
+    assert.equal(resolveConfig("/nonexistent").enabled, false);
+  });
+});
+
+describe("exporter request timeout", () => {
+  test("defaults to the spec 10000ms", () => {
+    const c = resolveConfig("/nonexistent");
+    assert.equal(c.tracesExportTimeoutMs, 10000);
+    assert.equal(c.metricsExportTimeoutMs, 10000);
+    assert.equal(c.logsExportTimeoutMs, 10000);
+  });
+
+  test("base env applies to all signals, per-signal env wins", () => {
+    process.env.OTEL_EXPORTER_OTLP_TIMEOUT = "2500";
+    let c = resolveConfig("/nonexistent");
+    assert.equal(c.tracesExportTimeoutMs, 2500);
+    assert.equal(c.metricsExportTimeoutMs, 2500);
+    assert.equal(c.logsExportTimeoutMs, 2500);
+    process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT = "8000";
+    c = resolveConfig("/nonexistent");
+    assert.equal(c.tracesExportTimeoutMs, 8000, "per-signal wins over base");
+    assert.equal(c.metricsExportTimeoutMs, 2500, "base still applies elsewhere");
+  });
+
+  test("invalid values fall back so the exporter constructor never throws", () => {
+    for (const bad of ["0", "-5", "abc", ""]) {
+      process.env.OTEL_EXPORTER_OTLP_TIMEOUT = bad;
+      const c = resolveConfig("/nonexistent");
+      assert.equal(c.tracesExportTimeoutMs, 10000, `fallback for "${bad}"`);
+    }
+  });
+});
+
+describe("batch processor env vars", () => {
+  test("OTEL_BSP_* map to trace batch options", () => {
+    process.env.OTEL_BSP_SCHEDULE_DELAY = "1500";
+    process.env.OTEL_BSP_MAX_QUEUE_SIZE = "4096";
+    process.env.OTEL_BSP_MAX_EXPORT_BATCH_SIZE = "256";
+    process.env.OTEL_BSP_EXPORT_TIMEOUT = "9000";
+    const c = resolveConfig("/nonexistent");
+    assert.equal(c.tracesExportInterval, 1500);
+    assert.equal(c.tracesMaxQueueSize, 4096);
+    assert.equal(c.tracesMaxExportBatchSize, 256);
+    assert.equal(c.tracesBatchExportTimeoutMs, 9000);
+  });
+
+  test("OTEL_BLP_* map to log batch options", () => {
+    process.env.OTEL_BLP_SCHEDULE_DELAY = "1200";
+    process.env.OTEL_BLP_MAX_QUEUE_SIZE = "1024";
+    const c = resolveConfig("/nonexistent");
+    assert.equal(c.logsExportInterval, 1200);
+    assert.equal(c.logsMaxQueueSize, 1024);
+    assert.equal(c.logsMaxExportBatchSize, 512, "unset keeps default");
+  });
+
+  test("invalid queue values fall back to defaults", () => {
+    process.env.OTEL_BSP_MAX_QUEUE_SIZE = "0";
+    const c = resolveConfig("/nonexistent");
+    assert.equal(c.tracesMaxQueueSize, 2048);
+  });
+
+  test("spec schedule delay wins over the extension var when both set", () => {
+    process.env.OTEL_BSP_SCHEDULE_DELAY = "1111";
+    process.env.OTEL_TRACES_EXPORT_INTERVAL = "2222";
+    assert.equal(resolveConfig("/nonexistent").tracesExportInterval, 1111);
+  });
+});
+
+describe("sampler selection", () => {
+  test("defaults to parentbased_traceidratio", () => {
+    assert.equal(resolveConfig("/nonexistent").sampler, "parentbased_traceidratio");
+  });
+
+  test("accepts the four spec names, case-insensitively", () => {
+    for (const [raw, expected] of [
+      ["ALWAYS_ON", "always_on"],
+      ["always_off", "always_off"],
+      ["TraceIdRatio", "traceidratio"],
+      ["parentbased_traceidratio", "parentbased_traceidratio"],
+    ] as const) {
+      process.env.OTEL_TRACES_SAMPLER = raw;
+      assert.equal(resolveConfig("/nonexistent").sampler, expected, raw);
+    }
+  });
+
+  test("unknown values fall back to the default", () => {
+    process.env.OTEL_TRACES_SAMPLER = "some_custom_sampler";
+    assert.equal(resolveConfig("/nonexistent").sampler, "parentbased_traceidratio");
+  });
+});

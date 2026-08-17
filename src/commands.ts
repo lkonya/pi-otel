@@ -41,9 +41,11 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
         `captureContent     ${c.captureContent}`,
         `sampleRatio        ${c.sampleRatio}`,
         `shutdown timeout   ${c.shutdownTimeoutMs}`,
-        `exported spans     ${h.spansExported}`,
+        `spans accepted     ${h.spansAccepted}`,
+        `exported spans     ${h.spansExported}${h.spansAccepted > h.spansExported ? `  (${h.spansAccepted - h.spansExported} unexported)` : ""}`,
         `metric batches     ${h.metricBatchesExported}`,
-        `log records        ${h.logRecordsExported}`,
+        `logs accepted      ${h.logRecordsAccepted}`,
+        `log records        ${h.logRecordsExported}${h.logRecordsAccepted > h.logRecordsExported ? `  (${h.logRecordsAccepted - h.logRecordsExported} unexported)` : ""}`,
         `last shutdown err  ${h.lastShutdownError ?? "(none)"}`,
       ];
       const text = lines.join("\n");

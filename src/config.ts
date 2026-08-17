@@ -20,6 +20,13 @@ export type Protocol = "grpc" | "http/protobuf" | "http/json";
 
 export type ExporterToken = "otlp" | "console" | "none";
 
+/** Sampler names accepted by OTEL_TRACES_SAMPLER. */
+export type SamplerSpec =
+  | "always_on"
+  | "always_off"
+  | "traceidratio"
+  | "parentbased_traceidratio";
+
 export interface SignalConfig {
   enabled: boolean;
 }
@@ -59,6 +66,20 @@ export interface ResolvedConfig {
   traces: SignalConfig;
   metrics: SignalConfig;
   logs: SignalConfig;
+  /** Sampler selection per OTEL_TRACES_SAMPLER. Default parentbased_traceidratio. */
+  sampler: SamplerSpec;
+  /** Exporter request timeout per signal, ms. Spec default 10000. */
+  tracesExportTimeoutMs: number;
+  metricsExportTimeoutMs: number;
+  logsExportTimeoutMs: number;
+  /** Trace batch queue bounds (OTEL_BSP_*). Defaults: 2048 / 512 / 30000. */
+  tracesMaxQueueSize: number;
+  tracesMaxExportBatchSize: number;
+  tracesBatchExportTimeoutMs: number;
+  /** Log batch queue bounds (OTEL_BLP_*). Defaults: 2048 / 512 / 30000. */
+  logsMaxQueueSize: number;
+  logsMaxExportBatchSize: number;
+  logsBatchExportTimeoutMs: number;
   /** OTel diag log level (internal SDK diagnostics). Default NONE. */
   diagLogLevel: DiagLogLevel;
   /** Emit telemetry from the extension itself (lifecycle events as logs). */
@@ -93,6 +114,16 @@ interface SettingsOtel {
   traces: boolean;
   metrics: boolean;
   logs: boolean;
+  sampler?: SamplerSpec;
+  tracesExportTimeoutMs?: number;
+  metricsExportTimeoutMs?: number;
+  logsExportTimeoutMs?: number;
+  tracesMaxQueueSize?: number;
+  tracesMaxExportBatchSize?: number;
+  tracesBatchExportTimeoutMs?: number;
+  logsMaxQueueSize?: number;
+  logsMaxExportBatchSize?: number;
+  logsBatchExportTimeoutMs?: number;
   diagLogLevel: string;
   selfLogs: boolean;
   shutdownTimeoutMs: number;
@@ -171,6 +202,25 @@ export function clampShutdownTimeoutMs(n: number, defaultMs: number): number {
   return Math.max(0, Math.trunc(n));
 }
 
+/**
+ * Clamp an exporter request timeout. The OTLP exporter constructor throws on
+ * a non-positive or non-finite timeoutMillis, so invalid values must resolve
+ * to the default here, never reach the exporter. Floor is 100ms.
+ */
+export function clampExportTimeoutMs(n: number, defaultMs: number): number {
+  if (!Number.isFinite(n) || n < MIN_EXPORT_INTERVAL_MS) return defaultMs;
+  return Math.trunc(n);
+}
+
+/**
+ * Clamp a batch queue bound (queue size, batch size, batch export timeout).
+ * Per the OTel env var spec, invalid values fall back to the default.
+ */
+export function clampPositiveInt(n: number, defaultVal: number): number {
+  if (!Number.isFinite(n) || n < 1) return defaultVal;
+  return Math.trunc(n);
+}
+
 const EXPORTER_TOKENS: ReadonlySet<string> = new Set(["otlp", "console", "none"]);
 
 function dedupeValidExporterParts(parts: string[]): ExporterToken[] {
@@ -202,6 +252,19 @@ export function parseExporterTokensFromArray(
   if (!tokens || tokens.length === 0) return fallback;
   const parsed = dedupeValidExporterParts(tokens);
   return parsed.length > 0 ? parsed : fallback;
+}
+
+const SAMPLER_SPECS: ReadonlySet<string> = new Set([
+  "always_on",
+  "always_off",
+  "traceidratio",
+  "parentbased_traceidratio",
+]);
+
+/** Validate a sampler name; unknown values fall back to the spec default. */
+export function normalizeSampler(v: string | undefined): SamplerSpec {
+  const p = (v ?? "").trim().toLowerCase();
+  return SAMPLER_SPECS.has(p) ? (p as SamplerSpec) : "parentbased_traceidratio";
 }
 
 function normalizeProtocol(v: string | undefined): Protocol {
@@ -277,13 +340,25 @@ export function resolveConfig(cwd: string): ResolvedConfig {
     ...parseKv(process.env.OTEL_EXPORTER_OTLP_HEADERS),
   };
 
-  // Master enable: PI_OTEL_DISABLED wins, else env enable flag, else settings.
+  // Master enable: PI_OTEL_DISABLED and the spec's OTEL_SDK_DISABLED are
+  // kill switches and win over any enable flag. Then env enable, then settings.
   const disabled =
-    envStr("PI_OTEL_DISABLED") === "1" ||
-    envStr("PI_OTEL_DISABLED")?.toLowerCase() === "true";
+    envBool(["PI_OTEL_DISABLED"], false) || envBool(["OTEL_SDK_DISABLED"], false);
   const enabled = disabled
     ? false
     : envBool(["PI_OTEL_ENABLED"], s.enabled ?? true);
+
+  // Exporter request timeout: per-signal env > OTEL_EXPORTER_OTLP_TIMEOUT >
+  // settings > spec default (10000). Invalid values fall back per signal.
+  const otlpTimeoutEnv = envNum(["OTEL_EXPORTER_OTLP_TIMEOUT"], Number.NaN);
+  const signalTimeout = (envName: string, settingsVal: number | undefined): number =>
+    clampExportTimeoutMs(
+      envNum(
+        [envName],
+        Number.isFinite(otlpTimeoutEnv) ? otlpTimeoutEnv : settingsVal ?? 10000,
+      ),
+      10000,
+    );
 
   const sampleRatio = Math.min(
     1,
@@ -338,16 +413,32 @@ export function resolveConfig(cwd: string): ResolvedConfig {
       parseExporterTokensFromArray(s.logsExporters, ["otlp"]),
     ),
     tracesExportInterval: clampExportIntervalMs(
-      envNum(["OTEL_TRACES_EXPORT_INTERVAL"], s.tracesExportInterval ?? 5000),
+      envNum(
+        ["OTEL_BSP_SCHEDULE_DELAY", "OTEL_TRACES_EXPORT_INTERVAL"],
+        s.tracesExportInterval ?? 5000,
+      ),
       5000,
     ),
     logsExportInterval: clampExportIntervalMs(
-      envNum(["OTEL_LOGS_EXPORT_INTERVAL"], s.logsExportInterval ?? 5000),
+      envNum(
+        ["OTEL_BLP_SCHEDULE_DELAY", "OTEL_LOGS_EXPORT_INTERVAL"],
+        s.logsExportInterval ?? 5000,
+      ),
       5000,
     ),
     traces: { enabled: envBool(["PI_OTEL_TRACES"], s.traces ?? true) },
     metrics: { enabled: envBool(["PI_OTEL_METRICS"], s.metrics ?? true) },
     logs: { enabled: envBool(["PI_OTEL_LOGS"], s.logs ?? true) },
+    sampler: normalizeSampler(envStr("OTEL_TRACES_SAMPLER") ?? s.sampler),
+    tracesExportTimeoutMs: signalTimeout("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", s.tracesExportTimeoutMs),
+    metricsExportTimeoutMs: signalTimeout("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT", s.metricsExportTimeoutMs),
+    logsExportTimeoutMs: signalTimeout("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", s.logsExportTimeoutMs),
+    tracesMaxQueueSize: clampPositiveInt(envNum(["OTEL_BSP_MAX_QUEUE_SIZE"], s.tracesMaxQueueSize ?? 2048), 2048),
+    tracesMaxExportBatchSize: clampPositiveInt(envNum(["OTEL_BSP_MAX_EXPORT_BATCH_SIZE"], s.tracesMaxExportBatchSize ?? 512), 512),
+    tracesBatchExportTimeoutMs: clampExportIntervalMs(envNum(["OTEL_BSP_EXPORT_TIMEOUT"], s.tracesBatchExportTimeoutMs ?? 30000), 30000),
+    logsMaxQueueSize: clampPositiveInt(envNum(["OTEL_BLP_MAX_QUEUE_SIZE"], s.logsMaxQueueSize ?? 2048), 2048),
+    logsMaxExportBatchSize: clampPositiveInt(envNum(["OTEL_BLP_MAX_EXPORT_BATCH_SIZE"], s.logsMaxExportBatchSize ?? 512), 512),
+    logsBatchExportTimeoutMs: clampExportIntervalMs(envNum(["OTEL_BLP_EXPORT_TIMEOUT"], s.logsBatchExportTimeoutMs ?? 30000), 30000),
     diagLogLevel: normalizeDiag(envStr("OTEL_LOG_LEVEL", "PI_OTEL_DIAG_LOG_LEVEL") ?? s.diagLogLevel),
     selfLogs: envBool(["PI_OTEL_SELF_LOGS"], s.selfLogs ?? true),
     shutdownTimeoutMs: clampShutdownTimeoutMs(

@@ -39,11 +39,19 @@ function captureRegisterCommands(getRuntime: () => TelemetryRuntime | null): {
 
 function minimalRuntime(
   configOverrides: Partial<ResolvedConfig>,
-  health: ExportHealth,
+  health: Partial<ExportHealth> = {},
 ): TelemetryRuntime {
   const base = resolveConfig("/test");
   const config = { ...base, ...configOverrides };
-  return { config, health } as TelemetryRuntime;
+  const fullHealth: ExportHealth = {
+    spansAccepted: 0,
+    spansExported: 0,
+    logRecordsAccepted: 0,
+    metricBatchesExported: 0,
+    logRecordsExported: 0,
+    ...health,
+  };
+  return { config, health: fullHealth } as TelemetryRuntime;
 }
 
 const EXPECTED_LABELS = [
@@ -60,8 +68,10 @@ const EXPECTED_LABELS = [
   "captureContent",
   "sampleRatio",
   "shutdown timeout",
+  "spans accepted",
   "exported spans",
   "metric batches",
+  "logs accepted",
   "log records",
   "last shutdown err",
 ] as const;
@@ -85,8 +95,10 @@ describe("otel-status command", () => {
     const serviceName = "pi-status-test";
     const shutdownTimeoutMs = 4500;
     const health: ExportHealth = {
+      spansAccepted: 5,
       spansExported: 12,
       metricBatchesExported: 3,
+      logRecordsAccepted: 9,
       logRecordsExported: 7,
     };
     const { runStatus } = captureRegisterCommands(() =>
@@ -121,7 +133,7 @@ describe("otel-status command", () => {
 
   test("signals off render as (off)", async () => {
     const base = resolveConfig("/test");
-    const health: ExportHealth = {
+    const health: Partial<ExportHealth> = {
       spansExported: 0,
       metricBatchesExported: 0,
       logRecordsExported: 0,
@@ -142,7 +154,7 @@ describe("otel-status command", () => {
   });
 
   test("export errors surface inline", async () => {
-    const health: ExportHealth = {
+    const health: Partial<ExportHealth> = {
       spansExported: 0,
       metricBatchesExported: 0,
       logRecordsExported: 0,
@@ -157,7 +169,7 @@ describe("otel-status command", () => {
   });
 
   test("last shutdown error renders when set", async () => {
-    const health: ExportHealth = {
+    const health: Partial<ExportHealth> = {
       spansExported: 0,
       metricBatchesExported: 0,
       logRecordsExported: 0,
@@ -199,7 +211,7 @@ describe("otel-flush and otel-test commands", () => {
 
   test("otel-flush does not throw headless and prints a confirmation", async () => {
     let flushed = false;
-    const rt = minimalRuntime({}, { spansExported: 0, metricBatchesExported: 0, logRecordsExported: 0 });
+    const rt = minimalRuntime({}, { spansExported: 0, metricBatchesExported: 0, logRecordsExported: 0 } as Partial<ExportHealth>);
     rt.flush = async () => { flushed = true; };
     const { commands } = captureRegisterCommands(() => rt);
     const fakeCtx = { hasUI: false } as unknown as ExtensionContext;
@@ -212,7 +224,7 @@ describe("otel-flush and otel-test commands", () => {
   test("otel-test does not throw headless with all signals disabled", async () => {
     const rt = minimalRuntime(
       { traces: { enabled: false }, metrics: { enabled: false }, logs: { enabled: false } },
-      { spansExported: 0, metricBatchesExported: 0, logRecordsExported: 0 },
+      { spansExported: 0, metricBatchesExported: 0, logRecordsExported: 0 } as Partial<ExportHealth>,
     );
     rt.flush = async () => {};
     const { commands } = captureRegisterCommands(() => rt);
@@ -224,5 +236,24 @@ describe("otel-flush and otel-test commands", () => {
     const { commands } = captureRegisterCommands(() => null);
     const out = await captureLog(() => commands["otel-flush"]!.handler([], { hasUI: false } as unknown as ExtensionContext));
     assert.match(out, /pi-otel: disabled/);
+  });
+});
+describe("otel-status export counts", () => {
+  test("shows an unexported hint when accepted exceeds exported", async () => {
+    const { commands, runStatus } = captureRegisterCommands(() =>
+      minimalRuntime({}, { spansAccepted: 10, spansExported: 7, logRecordsAccepted: 4, logRecordsExported: 4 }),
+    );
+    void commands;
+    const out = await runStatus();
+    assert.match(out, /exported spans\s+7\s+\(3 unexported\)/, "span delta hint");
+    assert.doesNotMatch(out, /log records\s+4\s+\(/, "no hint when nothing pending");
+  });
+
+  test("shows no hint when everything exported", async () => {
+    const { runStatus } = captureRegisterCommands(() =>
+      minimalRuntime({}, { spansAccepted: 7, spansExported: 7 }),
+    );
+    const out = await runStatus();
+    assert.match(out, /exported spans\s+7$/m);
   });
 });

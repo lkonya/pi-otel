@@ -17,6 +17,7 @@ import {
   detectHostId,
   resolveMetricTemporalityPreference,
   installSignalShutdown,
+  buildSampler,
   type ExportHealth,
 } from "../src/sdk.ts";
 import { AggregationTemporalityPreference } from "@opentelemetry/exporter-metrics-otlp-http";
@@ -157,7 +158,7 @@ describe("shutdown", () => {
     const span = traceProvider.getTracer("pi-otel-test", "0.0.0").startSpan("hang.test");
     span.end();
 
-    const health: ExportHealth = { spansExported: 0, metricBatchesExported: 0, logRecordsExported: 0 };
+    const health: ExportHealth = { spansAccepted: 0, spansExported: 0, logRecordsAccepted: 0, metricBatchesExported: 0, logRecordsExported: 0 };
     const timeoutMs = 400;
     const start = Date.now();
     await shutdownProviders(traceProvider, undefined, undefined, timeoutMs, health);
@@ -359,13 +360,15 @@ describe("per-signal exporters", () => {
     const rt = await startRuntime(cfg({ logsExportInterval: 1234 }));
     try {
       assert.ok(rt.loggerProvider, "logger provider present");
-      // Walk the provider's shared state to the first batch processor's delay.
+      // Walk the provider's shared state to the batch processor's delay. The
+      // first processor is the counting wrapper; its `inner` is the batch one.
       const shared = (rt.loggerProvider as unknown as {
         _sharedState: {
-          processors: Array<{ _scheduledDelayMillis?: number }>;
+          processors: Array<{ _scheduledDelayMillis?: number; inner?: { _scheduledDelayMillis?: number } }>;
         };
       })._sharedState;
-      const delay = shared.processors[0]?._scheduledDelayMillis;
+      const delay = shared.processors[0]?.inner?._scheduledDelayMillis
+        ?? shared.processors[0]?._scheduledDelayMillis;
       assert.equal(delay, 1234, "scheduledDelayMillis must match logsExportInterval");
     } finally {
       await rt.shutdown();
@@ -514,5 +517,77 @@ describe("installSignalShutdown", () => {
     f.emit("SIGHUP");
     await settle();
     assert.deepEqual(f.kills, [{ pid: 4242, signal: "SIGHUP" }], "re-raise happens even when the flush fails");
+  });
+});
+
+// --- sampler selection --------------------------------------------------------
+
+describe("buildSampler", () => {
+  test("always_on and unsampled parentbased resolve to the SDK default", () => {
+    assert.equal(buildSampler(cfg({ sampler: "always_on" })), undefined);
+    assert.equal(buildSampler(cfg({ sampler: "parentbased_traceidratio", sampleRatio: 1 })), undefined);
+  });
+
+  test("always_off yields a non-recording tracer", async () => {
+    const rt = await startRuntime(cfg({ sampler: "always_off" }));
+    try {
+      const span = rt.tracer.startSpan("off");
+      assert.equal(span.isRecording(), false);
+      span.end();
+    } finally {
+      await rt.shutdown();
+    }
+  });
+
+  test("traceidratio with ratio 0 yields a non-recording tracer", async () => {
+    const rt = await startRuntime(cfg({ sampler: "traceidratio", sampleRatio: 0 }));
+    try {
+      const span = rt.tracer.startSpan("zero-ratio");
+      assert.equal(span.isRecording(), false);
+      span.end();
+    } finally {
+      await rt.shutdown();
+    }
+  });
+
+  test("always_on ignores the ratio", async () => {
+    const rt = await startRuntime(cfg({ sampler: "always_on", sampleRatio: 0 }));
+    try {
+      const span = rt.tracer.startSpan("on");
+      assert.equal(span.isRecording(), true);
+      span.end();
+    } finally {
+      await rt.shutdown();
+    }
+  });
+});
+
+// --- accepted-count visibility -------------------------------------------------
+
+describe("counting processors", () => {
+  test("health counts accepted spans and log records", async () => {
+    const rt = await startRuntime(cfg());
+    try {
+      const span = rt.tracer.startSpan("counted");
+      span.end();
+      rt.logger?.emit({ severityNumber: 9, severityText: "INFO", body: "counted" });
+      await rt.flush();
+      assert.equal(rt.health.spansAccepted, 1, "span accepted by the batch processor");
+      assert.equal(rt.health.logRecordsAccepted, 1, "log record accepted");
+    } finally {
+      await rt.shutdown();
+    }
+  });
+
+  test("a garbage OTEL_EXPORTER_OTLP_TIMEOUT still builds a runtime", async () => {
+    // The OTLP exporter constructor throws on a non-positive timeoutMillis;
+    // config resolution must clamp before the value reaches it.
+    process.env.OTEL_EXPORTER_OTLP_TIMEOUT = "not-a-number";
+    try {
+      const rt = await startRuntime(cfg());
+      await rt.shutdown();
+    } finally {
+      delete process.env.OTEL_EXPORTER_OTLP_TIMEOUT;
+    }
   });
 });

@@ -17,10 +17,11 @@ import {
   diag,
   type DiagLogger,
   type Tracer,
+  type Sampler,
 } from "@opentelemetry/api";
-import type { SpanExporter } from "@opentelemetry/sdk-trace-base";
+import type { SpanExporter, SpanProcessor, ReadableSpan } from "@opentelemetry/sdk-trace-base";
 import type { PushMetricExporter } from "@opentelemetry/sdk-metrics";
-import type { LogRecordExporter } from "@opentelemetry/sdk-logs";
+import type { LogRecordExporter, LogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { OTLPLogExporter as LogProtoExporter } from "@opentelemetry/exporter-logs-otlp-proto";
 import { AggregationTemporalityPreference } from "@opentelemetry/exporter-metrics-otlp-http";
 import { OTLPMetricExporter as MetricProtoExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
@@ -49,6 +50,7 @@ import {
   BasicTracerProvider,
   BatchSpanProcessor,
   ConsoleSpanExporter,
+  AlwaysOffSampler,
   ParentBasedSampler,
   SimpleSpanProcessor,
   TraceIdRatioBasedSampler,
@@ -73,8 +75,12 @@ export interface ExportHealth {
   metricsError?: string;
   logsError?: string;
   lastShutdownError?: string;
+  /** Total spans accepted by a batch processor (onEnd). */
+  spansAccepted: number;
   /** Total spans accepted by a successful export (sum of batch sizes). */
   spansExported: number;
+  /** Total log records accepted by a batch processor (onEmit). */
+  logRecordsAccepted: number;
   /** Successful metric export calls (one ResourceMetrics payload each). */
   metricBatchesExported: number;
   /** Total log records accepted by a successful export (sum of batch sizes). */
@@ -109,6 +115,9 @@ export interface TelemetryRuntime {
 export interface ExporterOpts {
   url: string;
   headers: Record<string, string>;
+  /** Request timeout. The OTLP exporter constructor throws on <= 0 or NaN;
+   * config resolution guarantees a positive finite value. */
+  timeoutMillis: number;
 }
 
 /**
@@ -159,6 +168,68 @@ async function newLogExporter(p: Protocol, o: ExporterOpts): Promise<LogRecordEx
     return new OTLPLogExporter(o);
   }
   return new LogProtoExporter(o);
+}
+
+/** Build the sampler for the resolved config. Undefined means the SDK default
+ * (parent-based always-on), which is what always_on and an unsampled
+ * parentbased_traceidratio resolve to. */
+export function buildSampler(cfg: ResolvedConfig): Sampler | undefined {
+  if (cfg.sampler === "always_on") return undefined;
+  if (cfg.sampler === "always_off") return new AlwaysOffSampler();
+  const ratio = Math.min(1, Math.max(0, cfg.sampleRatio));
+  if (cfg.sampler === "traceidratio") return new TraceIdRatioBasedSampler(ratio);
+  if (ratio >= 1) return undefined;
+  return new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(ratio) });
+}
+
+type SdkSpan = Parameters<SpanProcessor["onStart"]>[0];
+type SpanParentContext = Parameters<SpanProcessor["onStart"]>[1];
+
+/**
+ * Delegating SpanProcessor that counts spans handed to the inner batch
+ * processor (onEnd = queued for export). Accepted minus exported, read after
+ * a flush, surfaces queue drops and failed exports in /otel-status.
+ */
+export class CountingSpanProcessor implements SpanProcessor {
+  constructor(
+    readonly inner: SpanProcessor,
+    private readonly onAccept: () => void,
+  ) {}
+  onStart(span: SdkSpan, parentContext: SpanParentContext): void {
+    this.inner.onStart(span, parentContext);
+  }
+  onEnd(span: ReadableSpan): void {
+    this.onAccept();
+    this.inner.onEnd(span);
+  }
+  forceFlush(): Promise<void> {
+    return this.inner.forceFlush();
+  }
+  shutdown(): Promise<void> {
+    return this.inner.shutdown();
+  }
+}
+
+type LogRecordLike = Parameters<LogRecordProcessor["onEmit"]>[0];
+type LogEmitContext = Parameters<LogRecordProcessor["onEmit"]>[1];
+
+/** Delegating LogRecordProcessor that counts records handed to the inner
+ * batch processor. Same accepted-vs-exported visibility as spans. */
+export class CountingLogRecordProcessor implements LogRecordProcessor {
+  constructor(
+    readonly inner: LogRecordProcessor,
+    private readonly onAccept: () => void,
+  ) {}
+  onEmit(logRecord: LogRecordLike, context?: LogEmitContext): void {
+    this.onAccept();
+    this.inner.onEmit(logRecord, context);
+  }
+  forceFlush(): Promise<void> {
+    return this.inner.forceFlush();
+  }
+  shutdown(): Promise<void> {
+    return this.inner.shutdown();
+  }
 }
 
 /** Generic export-result shape used by all three exporter families. */
@@ -330,7 +401,9 @@ export async function startRuntime(
 ): Promise<TelemetryRuntime> {
   const hasUI = opts.hasUI ?? false;
   const health: ExportHealth = {
+    spansAccepted: 0,
     spansExported: 0,
+    logRecordsAccepted: 0,
     metricBatchesExported: 0,
     logRecordsExported: 0,
   };
@@ -355,26 +428,31 @@ export async function startRuntime(
         if (token === "none") continue;
         if (token === "otlp") {
           const exporter = trackHealth(
-            await newTraceExporter(cfg.protocol, { url: cfg.tracesEndpoint, headers: cfg.headers }),
+            await newTraceExporter(cfg.protocol, { url: cfg.tracesEndpoint, headers: cfg.headers, timeoutMillis: cfg.tracesExportTimeoutMs }),
             (ok, count, err) => {
               if (ok) { health.spansExported += count; health.tracesError = undefined; }
               else { health.tracesError = err; }
             },
           );
           spanProcessors.push(
-            new BatchSpanProcessor(exporter, { scheduledDelayMillis: cfg.tracesExportInterval }),
+            new CountingSpanProcessor(
+              new BatchSpanProcessor(exporter, {
+                scheduledDelayMillis: cfg.tracesExportInterval,
+                maxQueueSize: cfg.tracesMaxQueueSize,
+                maxExportBatchSize: cfg.tracesMaxExportBatchSize,
+                exportTimeoutMillis: cfg.tracesBatchExportTimeoutMs,
+              }),
+              () => { health.spansAccepted++; },
+            ),
           );
         } else if (token === "console") {
           spanProcessors.push(new SimpleSpanProcessor(new ConsoleSpanExporter()));
         }
       }
       if (spanProcessors.length > 0) {
-        const sampler = cfg.sampleRatio >= 1
-          ? undefined
-          : new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(cfg.sampleRatio) });
         traceProvider = new BasicTracerProvider({
           resource,
-          ...(sampler ? { sampler } : {}),
+          sampler: buildSampler(cfg),
           spanProcessors,
         });
       }
@@ -391,7 +469,7 @@ export async function startRuntime(
         if (token === "none") continue;
         if (token === "otlp") {
           const exporter = trackHealth(
-            await newMetricExporter(cfg.protocol, { url: cfg.metricsEndpoint, headers: cfg.headers }),
+            await newMetricExporter(cfg.protocol, { url: cfg.metricsEndpoint, headers: cfg.headers, timeoutMillis: cfg.metricsExportTimeoutMs }),
             (ok, _count, err) => {
               if (ok) { health.metricBatchesExported++; health.metricsError = undefined; }
               else { health.metricsError = err; }
@@ -425,14 +503,22 @@ export async function startRuntime(
         if (token === "none") continue;
         if (token === "otlp") {
           const exporter = trackHealth(
-            await newLogExporter(cfg.protocol, { url: cfg.logsEndpoint, headers: cfg.headers }),
+            await newLogExporter(cfg.protocol, { url: cfg.logsEndpoint, headers: cfg.headers, timeoutMillis: cfg.logsExportTimeoutMs }),
             (ok, count, err) => {
               if (ok) { health.logRecordsExported += count; health.logsError = undefined; }
               else { health.logsError = err; }
             },
           );
           processors.push(
-            new BatchLogRecordProcessor(exporter, { scheduledDelayMillis: cfg.logsExportInterval }),
+            new CountingLogRecordProcessor(
+              new BatchLogRecordProcessor(exporter, {
+                scheduledDelayMillis: cfg.logsExportInterval,
+                maxQueueSize: cfg.logsMaxQueueSize,
+                maxExportBatchSize: cfg.logsMaxExportBatchSize,
+                exportTimeoutMillis: cfg.logsBatchExportTimeoutMs,
+              }),
+              () => { health.logRecordsAccepted++; },
+            ),
           );
         } else if (token === "console") {
           processors.push(new SimpleLogRecordProcessor(new ConsoleLogRecordExporter()));
