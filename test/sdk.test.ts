@@ -223,7 +223,7 @@ describe("resource", () => {
   test("resource carries service.name and pi.cwd", async () => {
     const rt = await startRuntime(cfg());
     try {
-      const resource = rt.traceProvider!["resource"] ?? (rt.traceProvider as unknown as { _resource: { attributes: Record<string, unknown> } })._resource;
+      const resource = (rt.traceProvider as unknown as { _resource: { attributes: Record<string, unknown> } })._resource;
       const attrs = resource.attributes;
       assert.equal(attrs["service.name"], "pi");
       assert.equal(attrs["pi.cwd"], "/test");

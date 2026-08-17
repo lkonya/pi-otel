@@ -2,6 +2,7 @@ import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { basename } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
  * End-to-end integration test.
@@ -93,7 +94,7 @@ function fakePi() {
       emit(ch: string, d: unknown) { for (const fn of eventListeners.get(ch) ?? []) fn(d); },
     },
     getThinkingLevel: () => "off",
-  };
+  } as unknown as ExtensionAPI;
   return { pi, handlers, commands, ctx };
 }
 

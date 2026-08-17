@@ -95,32 +95,32 @@ describe("span tree shape", () => {
   test("llm_request is a CLIENT span (gen_ai convention)", async () => {
     runHappyPath(h);
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].kind, SpanKind.CLIENT);
+    assert.equal(h.span(SPAN_LLM_REQUEST).kind, SpanKind.CLIENT);
   });
 
   test("session/interaction/turn are INTERNAL kind", async () => {
     runHappyPath(h);
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_SESSION].kind, SpanKind.INTERNAL);
-    assert.equal(h.spansByName()[SPAN_INTERACTION].kind, SpanKind.INTERNAL);
-    assert.equal(h.spansByName()[SPAN_TURN].kind, SpanKind.INTERNAL);
+    assert.equal(h.span(SPAN_SESSION).kind, SpanKind.INTERNAL);
+    assert.equal(h.span(SPAN_INTERACTION).kind, SpanKind.INTERNAL);
+    assert.equal(h.span(SPAN_TURN).kind, SpanKind.INTERNAL);
   });
 
   test("turn is a child of interaction, interaction of session", async () => {
     runHappyPath(h);
     await h.flush();
     const spans = h.spansByName();
-    assert.equal(spans[SPAN_TURN].parentSpanContext?.spanId, spans[SPAN_INTERACTION].spanContext().spanId);
-    assert.equal(spans[SPAN_INTERACTION].parentSpanContext?.spanId, spans[SPAN_SESSION].spanContext().spanId);
+    assert.equal(h.span(SPAN_TURN).parentSpanContext?.spanId, h.span(SPAN_INTERACTION).spanContext().spanId);
+    assert.equal(h.span(SPAN_INTERACTION).parentSpanContext?.spanId, h.span(SPAN_SESSION).spanContext().spanId);
   });
 
   test("tool span is a child of turn (sibling of llm_request, not child of it)", async () => {
     runHappyPath(h, { tool: true });
     await h.flush();
     const spans = h.spansByName();
-    const tool = spans["pi.tool.bash"];
-    const turn = spans[SPAN_TURN];
-    const llm = spans[SPAN_LLM_REQUEST];
+    const tool = h.span("pi.tool.bash");
+    const turn = h.span(SPAN_TURN);
+    const llm = h.span(SPAN_LLM_REQUEST);
     assert.ok(tool, "tool span present");
     assert.equal(tool.parentSpanContext?.spanId, turn.spanContext().spanId, "tool parented under turn");
     assert.notEqual(tool.parentSpanContext?.spanId, llm.spanContext().spanId, "tool NOT parented under llm");
@@ -132,9 +132,9 @@ describe("common attributes", () => {
     runHappyPath(h);
     await h.flush();
     const spans = h.spansByName();
-    assert.equal(spans[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_SYSTEM], "anthropic");
-    assert.equal(ATTR_GEN_AI_SYSTEM in spans[SPAN_SESSION].attributes, false);
-    assert.equal(ATTR_GEN_AI_SYSTEM in spans[SPAN_INTERACTION].attributes, false);
+    assert.equal(h.span(SPAN_LLM_REQUEST).attributes[ATTR_GEN_AI_SYSTEM], "anthropic");
+    assert.equal(ATTR_GEN_AI_SYSTEM in h.span(SPAN_SESSION).attributes, false);
+    assert.equal(ATTR_GEN_AI_SYSTEM in h.span(SPAN_INTERACTION).attributes, false);
   });
 
   test("every span carries pi.session.id", async () => {
@@ -148,13 +148,13 @@ describe("common attributes", () => {
   test("turn carries turn.index", async () => {
     runHappyPath(h);
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_TURN].attributes[ATTR_PI_TURN_INDEX], 0);
+    assert.equal(h.span(SPAN_TURN).attributes[ATTR_PI_TURN_INDEX], 0);
   });
 
   test("interaction carries interaction.id", async () => {
     runHappyPath(h);
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_INTERACTION].attributes[ATTR_PI_INTERACTION_ID], 1);
+    assert.equal(h.span(SPAN_INTERACTION).attributes[ATTR_PI_INTERACTION_ID], 1);
   });
 });
 
@@ -163,14 +163,14 @@ describe("session start reason", () => {
     h.tracker.startSession("fork");
     h.tracker.endSession();
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_SESSION].attributes[ATTR_PI_SESSION_REASON], "fork");
+    assert.equal(h.span(SPAN_SESSION).attributes[ATTR_PI_SESSION_REASON], "fork");
   });
 
   test("startSession() with no reason omits pi.session.reason", async () => {
     h.tracker.startSession();
     h.tracker.endSession();
     await h.flush();
-    const attrs = h.spansByName()[SPAN_SESSION].attributes;
+    const attrs = h.span(SPAN_SESSION).attributes;
     assert.equal(ATTR_PI_SESSION_REASON in attrs, false);
   });
 
@@ -178,14 +178,14 @@ describe("session start reason", () => {
     h.tracker.startSession("fork", "parent-abc");
     h.tracker.endSession();
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_SESSION].attributes[ATTR_PI_SESSION_PARENT_ID], "parent-abc");
+    assert.equal(h.span(SPAN_SESSION).attributes[ATTR_PI_SESSION_PARENT_ID], "parent-abc");
   });
 
   test("startSession() with no parentId omits pi.session.parent_id", async () => {
     h.tracker.startSession();
     h.tracker.endSession();
     await h.flush();
-    const attrs = h.spansByName()[SPAN_SESSION].attributes;
+    const attrs = h.span(SPAN_SESSION).attributes;
     assert.equal(ATTR_PI_SESSION_PARENT_ID in attrs, false);
   });
 });
@@ -208,7 +208,7 @@ describe("llm usage attribution", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
     assert.equal(a[ATTR_GEN_AI_INPUT_TOKENS], 100);
     assert.equal(a[ATTR_GEN_AI_OUTPUT_TOKENS], 50);
     assert.equal(a[ATTR_GEN_AI_CACHE_READ_TOKENS], 30);
@@ -225,7 +225,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ cacheWrite: 10, stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
     assert.equal(ATTR_GEN_AI_CACHE_WRITE_1H_TOKENS in a, false, "must not set 1h attr when undefined");
     assert.equal(a[ATTR_GEN_AI_CACHE_WRITE_TOKENS], 10);
   });
@@ -238,7 +238,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ input: 10, output: 5, reasoning: 42, stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
     assert.equal(a[ATTR_GEN_AI_REASONING_TOKENS], 42, "reasoning tokens captured");
   });
 
@@ -250,7 +250,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ input: 10, output: 5, stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
     assert.equal(ATTR_GEN_AI_REASONING_TOKENS in a, false, "must not set reasoning attr when undefined");
   });
 
@@ -262,7 +262,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ responseModel: "claude-4-sonnet-20250514", stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
     assert.equal(a[ATTR_GEN_AI_REQUEST_MODEL], "claude-4-sonnet");
     assert.equal(a[ATTR_GEN_AI_RESPONSE_MODEL], "claude-4-sonnet-20250514");
   });
@@ -275,7 +275,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ stopReason: "end_turn" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    assert.deepEqual(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_RESPONSE_FINISH_REASONS], ["end_turn"]);
+    assert.deepEqual(h.span(SPAN_LLM_REQUEST).attributes[ATTR_GEN_AI_RESPONSE_FINISH_REASONS], ["end_turn"]);
   });
 
   test("sets ERROR status on finishReason=error and records message", async () => {
@@ -286,7 +286,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ stopReason: "error", errorMessage: "rate limited" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const span = h.spansByName()[SPAN_LLM_REQUEST];
+    const span = h.span(SPAN_LLM_REQUEST);
     assert.equal(span.status.code, SpanStatusCode.ERROR);
     assert.equal(span.status.message, "rate limited");
   });
@@ -301,7 +301,7 @@ describe("llm usage attribution", () => {
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
     // message.responseId (set in completeLlm) overwrites the header-derived value.
-    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_RESPONSE_ID], "from-message");
+    assert.equal(h.span(SPAN_LLM_REQUEST).attributes[ATTR_GEN_AI_RESPONSE_ID], "from-message");
   });
 
   test("response.id from mixed-case header names", async () => {
@@ -313,7 +313,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_GEN_AI_RESPONSE_ID], "mixed-case-id");
+    assert.equal(h.span(SPAN_LLM_REQUEST).attributes[ATTR_GEN_AI_RESPONSE_ID], "mixed-case-id");
   });
 
   test("records http.response.status_code from provider response", async () => {
@@ -325,7 +325,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ stopReason: "error" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
     assert.equal(a[ATTR_HTTP_STATUS_CODE], 429);
   });
 
@@ -338,7 +338,7 @@ describe("llm usage attribution", () => {
     h.tracker.completeLlm(asstMsg({ stopReason: "error" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const span = h.spansByName()[SPAN_LLM_REQUEST];
+    const span = h.span(SPAN_LLM_REQUEST);
     assert.equal(span.attributes["error.type"], "server_error");
     assert.equal(span.status.code, SpanStatusCode.ERROR);
   });
@@ -411,11 +411,11 @@ describe("llm metrics", () => {
     h.tracker.completeLlm(asstMsg({ text: "ok", stopReason: "stop" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h.span(SPAN_LLM_REQUEST);
     assert.equal(llm.attributes["error.type"], undefined, "no error.type after recovery");
     assert.equal(llm.status.code, SpanStatusCode.UNSET, "status stays UNSET after recovery");
     assert.equal(
-      h.spansByName()[SPAN_SESSION].attributes[ATTR_PI_ERROR_COUNT],
+      h.span(SPAN_SESSION).attributes[ATTR_PI_ERROR_COUNT],
       undefined,
       "no session error counted",
     );
@@ -434,10 +434,10 @@ describe("llm metrics", () => {
     h.tracker.completeLlm(asstMsg({ stopReason: "error", errorMessage: "HTTP 500" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h.span(SPAN_LLM_REQUEST);
     assert.equal(llm.attributes["error.type"], "server_error", "final attempt's category wins");
     assert.equal(llm.status.code, SpanStatusCode.ERROR);
-    assert.equal(h.spansByName()[SPAN_SESSION].attributes[ATTR_PI_ERROR_COUNT], 1);
+    assert.equal(h.span(SPAN_SESSION).attributes[ATTR_PI_ERROR_COUNT], 1);
   });
 
   test("a defensively closed failed request keeps its error markers", async () => {
@@ -451,7 +451,7 @@ describe("llm metrics", () => {
     h.tracker.endInteraction({ reason: "session_switch" });
     h.tracker.endSession();
     await h.flush();
-    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h.span(SPAN_LLM_REQUEST);
     assert.equal(llm.attributes["error.type"], "server_error");
     assert.equal(llm.status.code, SpanStatusCode.ERROR);
   });
@@ -465,7 +465,7 @@ describe("tool spans", () => {
   test("carry gen_ai.tool.name, call.id, and is_error", async () => {
     runHappyPath(h, { tool: true });
     await h.flush();
-    const a = h.spansByName()["pi.tool.bash"].attributes;
+    const a = h.span("pi.tool.bash").attributes;
     assert.equal(a[ATTR_GEN_AI_TOOL_NAME], "bash");
     assert.equal(a[ATTR_GEN_AI_TOOL_CALL_ID], "call_1");
     assert.equal(a[ATTR_PI_TOOL_IS_ERROR], false);
@@ -479,7 +479,7 @@ describe("tool spans", () => {
     h.tracker.endTool("t1", true, { error: "exit 1" });
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    const span = h.spansByName()["pi.tool.bash"];
+    const span = h.span("pi.tool.bash");
     assert.equal(span.status.code, SpanStatusCode.ERROR);
     assert.equal(span.attributes["error.type"], "tool_error");
   });
@@ -488,7 +488,7 @@ describe("tool spans", () => {
     runHappyPath(h, { tool: true });
     const recs = h.metrics.counters["toolcalls"] ?? [];
     assert.equal(recs.length, 1);
-    assert.equal(recs[0].attrs[ATTR_GEN_AI_TOOL_NAME], "bash");
+    assert.equal(recs[0]!.attrs[ATTR_GEN_AI_TOOL_NAME], "bash");
   });
 
   test("unknown toolCallId on endTool is a safe no-op", async () => {
@@ -497,7 +497,7 @@ describe("tool spans", () => {
     h.tracker.endTool("nonexistent", false, {}); // should not throw
     h.tracker.endSession();
     await h.flush();
-    assert.ok(h.spansByName()["pi.tool.bash"], "real tool span still present");
+    assert.ok(h.span("pi.tool.bash"), "real tool span still present");
   });
 
   test("tool span links to open llm_request span", async () => {
@@ -513,13 +513,13 @@ describe("tool spans", () => {
     h.tracker.endSession();
     await h.flush();
     const spans = h.spansByName();
-    const tool = spans["pi.tool.bash"];
-    const llm = spans[SPAN_LLM_REQUEST];
+    const tool = h.span("pi.tool.bash");
+    const llm = h.span(SPAN_LLM_REQUEST);
     assert.ok(tool, "tool span present");
     assert.ok(llm, "llm span present");
     assert.equal(tool.links.length, 1);
-    assert.equal(tool.links[0].context.traceId, llm.spanContext().traceId);
-    assert.equal(tool.links[0].context.spanId, llm.spanContext().spanId);
+    assert.equal(tool.links[0]!.context.traceId, llm.spanContext().traceId);
+    assert.equal(tool.links[0]!.context.spanId, llm.spanContext().spanId);
   });
 
   test("tool span has no links when llm_request is not open", async () => {
@@ -532,7 +532,7 @@ describe("tool spans", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const tool = h.spansByName()["pi.tool.bash"];
+    const tool = h.span("pi.tool.bash");
     assert.ok(tool, "tool span present");
     assert.equal(tool.links.length, 0);
   });
@@ -590,14 +590,14 @@ describe("cancellation", () => {
     h.tracker.markCancelled();
     h.tracker.endTool("t1", false, {});
     h.tracker.endLlm({ reason: "cancel" });
-    h.tracker.endTurn({ cancelled: true });
-    h.tracker.endInteraction({ cancelled: true });
+    h.tracker.endTurn({ reason: "cancel", cancelled: true });
+    h.tracker.endInteraction({ reason: "cancel", cancelled: true });
     h.tracker.endSession();
     await h.flush();
     const spans = h.spansByName();
-    assert.equal(spans[SPAN_LLM_REQUEST].attributes[ATTR_PI_CANCELLED], true);
-    assert.equal(spans["pi.tool.bash"].attributes[ATTR_PI_CANCELLED], true);
-    assert.equal(spans[SPAN_TURN].attributes[ATTR_PI_CANCELLED], true);
+    assert.equal(h.span(SPAN_LLM_REQUEST).attributes[ATTR_PI_CANCELLED], true);
+    assert.equal(h.span("pi.tool.bash").attributes[ATTR_PI_CANCELLED], true);
+    assert.equal(h.span(SPAN_TURN).attributes[ATTR_PI_CANCELLED], true);
   });
 
   test("markCancelled returns true and the abort path is what bumps turn.cancellations", async () => {
@@ -609,7 +609,7 @@ describe("cancellation", () => {
     h.tracker.startTurn(0);
     const cancelled = h.tracker.markCancelled();
     assert.equal(cancelled, true, "markCancelled reports an in-flight turn");
-    h.tracker.endTurn({ cancelled: true });
+    h.tracker.endTurn({ reason: "cancel", cancelled: true });
     h.tracker.endInteraction();
     h.tracker.endSession();
     // Tracker does not bump the metric itself; the index.ts abort listener
@@ -638,8 +638,8 @@ describe("cancellation", () => {
     h.tracker.completeLlm(asstMsg({ stopReason: "aborted" }));
     h.tracker.endTurn(); h.tracker.endInteraction(); h.tracker.endSession();
     await h.flush();
-    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].attributes[ATTR_PI_CANCELLED], true);
-    assert.equal(h.spansByName()[SPAN_LLM_REQUEST].status.code, SpanStatusCode.ERROR);
+    assert.equal(h.span(SPAN_LLM_REQUEST).attributes[ATTR_PI_CANCELLED], true);
+    assert.equal(h.span(SPAN_LLM_REQUEST).status.code, SpanStatusCode.ERROR);
   });
 });
 
@@ -659,9 +659,9 @@ describe("orphan hygiene", () => {
     h.tracker.endSession();
     await h.flush();
     const spans = h.spansByName();
-    assert.equal(spans[SPAN_LLM_REQUEST].ended, true);
-    assert.equal(spans["pi.tool.bash"].ended, true);
-    assert.equal(spans[SPAN_TURN].ended, true);
+    assert.equal(h.span(SPAN_LLM_REQUEST).ended, true);
+    assert.equal(h.span("pi.tool.bash").ended, true);
+    assert.equal(h.span(SPAN_TURN).ended, true);
   });
 
   test("ending an interaction mid-flight marks it orphaned", async () => {
@@ -672,7 +672,7 @@ describe("orphan hygiene", () => {
     h.tracker.endSession();
     await h.flush();
     // The orphaned interaction/turn/llm spans get the pi.orphaned marker.
-    const interaction = h.spansByName()[SPAN_INTERACTION];
+    const interaction = h.span(SPAN_INTERACTION);
     assert.equal(interaction.attributes[ATTR_PI_ORPHANED], true, "interaction marked orphaned");
   });
 
@@ -729,7 +729,7 @@ describe("content capture modes", () => {
     h2.tracker.endInteraction();
     h2.tracker.endSession();
     await h2.flush();
-    const attrs = h2.spansByName()[SPAN_INTERACTION].attributes;
+    const attrs = h2.span(SPAN_INTERACTION).attributes;
     assert.equal("pi.user_prompt" in attrs, false, "no raw prompt");
     // fingerprint present instead
     assert.ok("pi.user_prompt.bytes" in attrs, "fingerprint bytes present");
@@ -753,7 +753,7 @@ describe("content capture modes", () => {
     h2.tracker.endInteraction();
     h2.tracker.endSession();
     await h2.flush();
-    const llm = h2.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h2.span(SPAN_LLM_REQUEST);
     assert.ok(llm, "llm span present");
     // No JSON message attributes carrying raw content.
     assert.equal(ATTR_GEN_AI_INPUT_MESSAGES in llm.attributes, false, "no raw gen_ai.input.messages");
@@ -781,7 +781,7 @@ describe("content capture modes", () => {
     h2.tracker.endInteraction();
     h2.tracker.endSession();
     await h2.flush();
-    assert.equal(h2.spansByName()[SPAN_INTERACTION].attributes["pi.user_prompt"], "secret-prompt-content");
+    assert.equal(h2.span(SPAN_INTERACTION).attributes["pi.user_prompt"], "secret-prompt-content");
   });
 
   test("no_tool_content emits prompt but not tool args", async () => {
@@ -797,10 +797,10 @@ describe("content capture modes", () => {
     await h2.flush();
     const spans = h2.spansByName();
     // prompt captured
-    assert.equal(spans[SPAN_INTERACTION].attributes["pi.user_prompt"], "the-prompt");
+    assert.equal(h2.span(SPAN_INTERACTION).attributes["pi.user_prompt"], "the-prompt");
     // tool args/result NOT captured
-    assert.equal(ATTR_GEN_AI_TOOL_CALL_ARGUMENTS in spans["pi.tool.bash"].attributes, false);
-    assert.equal(ATTR_GEN_AI_TOOL_CALL_RESULT in spans["pi.tool.bash"].attributes, false);
+    assert.equal(ATTR_GEN_AI_TOOL_CALL_ARGUMENTS in h2.span("pi.tool.bash").attributes, false);
+    assert.equal(ATTR_GEN_AI_TOOL_CALL_RESULT in h2.span("pi.tool.bash").attributes, false);
   });
 
   test("no_tool_content emits raw prompt/completion on LLM span but no tool args", async () => {
@@ -822,7 +822,7 @@ describe("content capture modes", () => {
     }));
     h2.tracker.endTurn(); h2.tracker.endInteraction(); h2.tracker.endSession();
     await h2.flush();
-    const llm = h2.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h2.span(SPAN_LLM_REQUEST);
     // Prompt and completion are captured raw.
     const attrBlob = JSON.stringify(llm.attributes);
     const eventBlob = JSON.stringify(llm.events);
@@ -848,7 +848,7 @@ describe("content capture modes", () => {
     h2.tracker.completeLlm(asstMsg({}));
     h2.tracker.endTurn(); h2.tracker.endInteraction(); h2.tracker.endSession();
     await h2.flush();
-    const a = h2.spansByName()["pi.tool.bash"].attributes;
+    const a = h2.span("pi.tool.bash").attributes;
     assert.ok(a[ATTR_GEN_AI_TOOL_CALL_ARGUMENTS]);
     assert.ok(a[ATTR_GEN_AI_TOOL_CALL_RESULT]);
   });
@@ -916,10 +916,10 @@ describe("gen_ai.system provider", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_LLM_REQUEST].attributes;
+    const a = h.span(SPAN_LLM_REQUEST).attributes;
     assert.equal(a[ATTR_GEN_AI_SYSTEM], "anthropic");
     assert.equal(a["gen_ai.agent.name"], "pi");
-    assert.equal(ATTR_GEN_AI_SYSTEM in h.spansByName()[SPAN_SESSION].attributes, false);
+    assert.equal(ATTR_GEN_AI_SYSTEM in h.span(SPAN_SESSION).attributes, false);
   });
 });
 
@@ -936,7 +936,7 @@ describe("pending input flush", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h.span(SPAN_LLM_REQUEST);
     const eventBlob = JSON.stringify(llm.events);
     const attrBlob = JSON.stringify(llm.attributes);
     assert.ok(
@@ -961,7 +961,7 @@ describe("session summary attributes", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_SESSION].attributes;
+    const a = h.span(SPAN_SESSION).attributes;
     assert.equal(a[ATTR_GEN_AI_INPUT_TOKENS], 30);
     assert.equal(a[ATTR_GEN_AI_OUTPUT_TOKENS], 20);
     assert.equal(a[ATTR_GEN_AI_COST_USD], 0.03);
@@ -990,23 +990,23 @@ describe("session summary attributes", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const session = h.spansByName()[SPAN_SESSION].attributes;
+    const session = h.span(SPAN_SESSION).attributes;
     assert.equal(session[ATTR_PI_TURN_COUNT], 3, "session totals turns across interactions");
     assert.equal(session[ATTR_PI_TOOL_COUNT], 3, "session totals tools across interactions");
     // Per-interaction totals remain scoped to that interaction.
     const interactions = h.spanExporter.getFinishedSpans().filter(s => s.name === SPAN_INTERACTION);
     assert.equal(interactions.length, 2);
-    assert.equal(interactions[0].attributes[ATTR_PI_TURN_COUNT], 2);
-    assert.equal(interactions[0].attributes[ATTR_PI_TOOL_COUNT], 1);
-    assert.equal(interactions[1].attributes[ATTR_PI_TURN_COUNT], 1);
-    assert.equal(interactions[1].attributes[ATTR_PI_TOOL_COUNT], 2);
+    assert.equal(interactions[0]!.attributes[ATTR_PI_TURN_COUNT], 2);
+    assert.equal(interactions[0]!.attributes[ATTR_PI_TOOL_COUNT], 1);
+    assert.equal(interactions[1]!.attributes[ATTR_PI_TURN_COUNT], 1);
+    assert.equal(interactions[1]!.attributes[ATTR_PI_TOOL_COUNT], 2);
   });
 
   test("session with no LLM activity omits usage summary attrs", async () => {
     h.tracker.startSession();
     h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_SESSION].attributes;
+    const a = h.span(SPAN_SESSION).attributes;
     assert.equal(ATTR_GEN_AI_INPUT_TOKENS in a, false);
     assert.equal(ATTR_GEN_AI_OUTPUT_TOKENS in a, false);
     assert.equal(ATTR_GEN_AI_COST_USD in a, false);
@@ -1025,7 +1025,7 @@ describe("session summary attributes", () => {
     h.tracker.endInteraction({ reason: "end", error: err });
     h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_SESSION].attributes;
+    const a = h.span(SPAN_SESSION).attributes;
     assert.equal(a[ATTR_PI_ERROR_COUNT], 1, "cascade counts the error once");
   });
 
@@ -1041,7 +1041,7 @@ describe("session summary attributes", () => {
     h.tracker.endInteraction({ reason: "end", error: new Error("second") });
     h.tracker.endSession();
     await h.flush();
-    const a = h.spansByName()[SPAN_SESSION].attributes;
+    const a = h.span(SPAN_SESSION).attributes;
     assert.equal(a[ATTR_PI_ERROR_COUNT], 2);
   });
 });
@@ -1059,7 +1059,7 @@ describe("time to completion", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h.span(SPAN_LLM_REQUEST);
     assert.ok(llm);
     const completionEvents = llm.events.filter(e => e.name === "gen_ai.completion");
     assert.equal(completionEvents.length, 1);
@@ -1077,7 +1077,7 @@ describe("time to completion", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h.span(SPAN_LLM_REQUEST);
     assert.ok(llm);
     assert.equal(llm.events.filter(e => e.name === "gen_ai.completion").length, 0);
     assert.equal(h.metrics.histograms["completion"]?.length ?? 0, 0);
@@ -1097,7 +1097,7 @@ describe("time to first token", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    const llm = h.spansByName()[SPAN_LLM_REQUEST];
+    const llm = h.span(SPAN_LLM_REQUEST);
     assert.ok(llm);
     const firstTokenEvents = llm.events.filter(e => e.name === "gen_ai.first_token");
     assert.equal(firstTokenEvents.length, 1);
@@ -1115,7 +1115,7 @@ describe("system prompt hash", () => {
     h.tracker.endSession();
     await h.flush();
     const expected = hashPrompt(prompt);
-    assert.equal(h.spansByName()[SPAN_INTERACTION].attributes[ATTR_GEN_AI_SYSTEM_PROMPT_HASH], expected);
+    assert.equal(h.span(SPAN_INTERACTION).attributes[ATTR_GEN_AI_SYSTEM_PROMPT_HASH], expected);
   });
 
   test("empty or whitespace prompt does not set hash", async () => {
@@ -1125,7 +1125,7 @@ describe("system prompt hash", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    assert.equal(ATTR_GEN_AI_SYSTEM_PROMPT_HASH in h.spansByName()[SPAN_INTERACTION].attributes, false);
+    assert.equal(ATTR_GEN_AI_SYSTEM_PROMPT_HASH in h.span(SPAN_INTERACTION).attributes, false);
   });
 });
 
@@ -1142,7 +1142,7 @@ describe("error categorization", () => {
     h.tracker.endInteraction();
     h.tracker.endSession();
     await h.flush();
-    return h.spansByName()[SPAN_LLM_REQUEST].attributes["error.type"] as string | undefined;
+    return h.span(SPAN_LLM_REQUEST).attributes["error.type"] as string | undefined;
   }
 
   test("recordProviderResponse maps HTTP statuses to error.type", async () => {

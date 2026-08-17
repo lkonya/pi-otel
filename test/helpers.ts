@@ -20,6 +20,9 @@ export interface Harness {
   flush: () => Promise<void>;
   /** All finished spans, keyed by name (last one wins on collision). */
   spansByName: () => Record<string, ReturnType<InMemorySpanExporter["getFinishedSpans"]>[number]>;
+  /** Finished span by name (last one wins); throws when absent so a missing
+   * span fails the test instead of tripping strict-index checks. */
+  span: (name: string) => ReturnType<InMemorySpanExporter["getFinishedSpans"]>[number];
   reset: () => void;
 }
 
@@ -80,6 +83,12 @@ export function harnessConfig(overrides: Partial<ResolvedConfig> = {}): Resolved
     logs: { enabled: true },
     diagLogLevel: 0,
     selfLogs: true,
+    shutdownTimeoutMs: 2000,
+    tracesExporters: ["otlp"],
+    metricsExporters: ["otlp"],
+    logsExporters: ["otlp"],
+    tracesExportInterval: 5000,
+    logsExportInterval: 5000,
     cwd: "/test",
     ...overrides,
   };
@@ -118,6 +127,12 @@ export function makeHarness(opts: { captureContent?: "metadata_only" | "no_tool_
       const out: Record<string, ReturnType<InMemorySpanExporter["getFinishedSpans"]>[number]> = {};
       for (const s of spanExporter.getFinishedSpans()) out[s.name] = s;
       return out;
+    },
+    span(name: string) {
+      const spans = spanExporter.getFinishedSpans().filter((s) => s.name === name);
+      const last = spans[spans.length - 1];
+      if (!last) throw new Error(`span not found: ${name}`);
+      return last;
     },
     reset() {
       spanExporter.reset();

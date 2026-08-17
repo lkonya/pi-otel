@@ -27,7 +27,7 @@ function captureRegisterCommands(getRuntime: () => TelemetryRuntime | null): {
       console.log = (s: string) => {
         captured = s;
       };
-      await commands["otel-status"].handler([], fakeCtx);
+      await commands["otel-status"]!.handler([], fakeCtx);
     } finally {
       console.log = orig;
     }
@@ -203,9 +203,9 @@ describe("otel-flush and otel-test commands", () => {
     rt.flush = async () => { flushed = true; };
     const { commands } = captureRegisterCommands(() => rt);
     const fakeCtx = { hasUI: false } as unknown as ExtensionContext;
-    await commands["otel-flush"].handler([], fakeCtx); // must not throw
+    await commands["otel-flush"]!.handler([], fakeCtx); // must not throw
     assert.equal(flushed, true, "flush was called");
-    const out = await captureLog(() => commands["otel-flush"].handler([], fakeCtx));
+    const out = await captureLog(() => commands["otel-flush"]!.handler([], fakeCtx));
     assert.match(out, /pi-otel: flushed/);
   });
 
@@ -216,13 +216,13 @@ describe("otel-flush and otel-test commands", () => {
     );
     rt.flush = async () => {};
     const { commands } = captureRegisterCommands(() => rt);
-    const out = await captureLog(() => commands["otel-test"].handler([], { hasUI: false } as unknown as ExtensionContext));
+    const out = await captureLog(() => commands["otel-test"]!.handler([], { hasUI: false } as unknown as ExtensionContext));
     assert.match(out, /all signals disabled/);
   });
 
   test("otel-flush with no runtime prints the disabled message headless", async () => {
     const { commands } = captureRegisterCommands(() => null);
-    const out = await captureLog(() => commands["otel-flush"].handler([], { hasUI: false } as unknown as ExtensionContext));
+    const out = await captureLog(() => commands["otel-flush"]!.handler([], { hasUI: false } as unknown as ExtensionContext));
     assert.match(out, /pi-otel: disabled/);
   });
 });
