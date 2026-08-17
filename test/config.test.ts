@@ -224,8 +224,15 @@ describe("capture normalization", () => {
     ["no_tool_content", "no_tool_content"],
     ["1", "full"],
     ["true", "full"],
+    ["0", "metadata_only"],
+    ["false", "metadata_only"],
     ["", "full"],
-    ["garbage", "full"],
+    ["garbage", "metadata_only"],
+    ["FULL", "full"],
+    ["Metadata_Only", "metadata_only"],
+    // Fail closed: a typo must not resolve to full capture.
+    ["metadata-only", "metadata_only"],
+    ["no_tool", "metadata_only"],
   ] as const) {
     test(`capture "${raw}" -> ${expected}`, () => {
       process.env.PI_OTEL_CAPTURE_CONTENT = raw;

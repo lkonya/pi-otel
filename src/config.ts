@@ -213,11 +213,16 @@ function normalizeProtocol(v: string | undefined): Protocol {
 }
 
 function normalizeCapture(v: string | undefined): ContentCapture {
-  const p = (v ?? "").trim().toLowerCase();
+  if (v === undefined || v.trim() === "") return "full"; // project requirement: capture everything by default
+  const p = v.trim().toLowerCase();
   if (p === "metadata_only") return "metadata_only";
   if (p === "no_tool_content") return "no_tool_content";
   if (p === "true" || p === "1" || p === "full") return "full";
-  return "full"; // project requirement: capture everything by default
+  if (p === "false" || p === "0") return "metadata_only";
+  // Unrecognized explicit values fail closed: a typo must not turn on full
+  // prompt capture. /otel-status shows the resolved value so this is
+  // discoverable.
+  return "metadata_only";
 }
 
 function normalizeDiag(v: string | undefined): DiagLogLevel {
