@@ -16,6 +16,7 @@ import {
   startRuntime,
   detectHostId,
   resolveMetricTemporalityPreference,
+  installSignalShutdown,
   type ExportHealth,
 } from "../src/sdk.ts";
 import { AggregationTemporalityPreference } from "@opentelemetry/exporter-metrics-otlp-http";
@@ -439,5 +440,79 @@ describe("signal handler lifecycle", () => {
     rt.removeProcessHooks();
     rt.removeProcessHooks(); // must not throw
     await rt.shutdown();
+  });
+});
+
+describe("installSignalShutdown", () => {
+  interface Kill { pid: number; signal: string }
+  function fakeProc() {
+    const listeners = new Map<string, Array<() => void>>();
+    const kills: Kill[] = [];
+    const proc = {
+      pid: 4242,
+      on(sig: string, l: () => void) {
+        (listeners.get(sig) ?? listeners.set(sig, []).get(sig)!).push(l);
+      },
+      removeListener(sig: string, l: () => void) {
+        const arr = listeners.get(sig) ?? [];
+        const i = arr.indexOf(l);
+        if (i >= 0) arr.splice(i, 1);
+      },
+      listenerCount(sig: string) {
+        return (listeners.get(sig) ?? []).length;
+      },
+      kill(pid: number, signal: string) {
+        kills.push({ pid, signal });
+      },
+    };
+    return {
+      proc,
+      kills,
+      emit(sig: string) {
+        for (const l of [...(listeners.get(sig) ?? [])]) l();
+      },
+    };
+  }
+  const settle = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  test("flushes and re-raises when it is the last handler", async () => {
+    const f = fakeProc();
+    let shutdowns = 0;
+    installSignalShutdown(async () => { shutdowns++; }, f.proc);
+    f.emit("SIGTERM");
+    await settle();
+    assert.equal(shutdowns, 1, "shutdown ran");
+    assert.deepEqual(f.kills, [{ pid: 4242, signal: "SIGTERM" }], "signal re-raised to restore default termination");
+    assert.equal(f.proc.listenerCount("SIGTERM"), 0, "listener removed");
+  });
+
+  test("does not re-raise when another handler owns the signal", async () => {
+    const f = fakeProc();
+    const other = () => {};
+    f.proc.on("SIGTERM", other);
+    installSignalShutdown(async () => {}, f.proc);
+    f.emit("SIGTERM");
+    await settle();
+    assert.deepEqual(f.kills, [], "no re-raise while another handler is registered");
+    assert.equal(f.proc.listenerCount("SIGTERM"), 1, "our listener removed, theirs kept");
+  });
+
+  test("detach removes listeners without running shutdown", async () => {
+    const f = fakeProc();
+    let shutdowns = 0;
+    const detach = installSignalShutdown(async () => { shutdowns++; }, f.proc);
+    detach();
+    f.emit("SIGHUP");
+    await settle();
+    assert.equal(shutdowns, 0);
+    assert.deepEqual(f.kills, []);
+  });
+
+  test("a shutdown rejection still re-raises", async () => {
+    const f = fakeProc();
+    installSignalShutdown(async () => { throw new Error("collector hung"); }, f.proc);
+    f.emit("SIGHUP");
+    await settle();
+    assert.deepEqual(f.kills, [{ pid: 4242, signal: "SIGHUP" }], "re-raise happens even when the flush fails");
   });
 });

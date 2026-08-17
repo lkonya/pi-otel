@@ -271,6 +271,59 @@ function signalExportersActive(tokens: ExporterToken[]): boolean {
   return tokens.length > 0 && !(tokens.length === 1 && tokens[0] === "none");
 }
 
+/** Process surface needed by installSignalShutdown. Injectable for tests. */
+export interface SignalCapableProcess {
+  pid: number;
+  on(signal: string, listener: () => void): unknown;
+  removeListener(signal: string, listener: () => void): unknown;
+  listenerCount(signal: string): number;
+  kill(pid: number, signal?: string): unknown;
+}
+
+const SIGNALS = ["SIGTERM", "SIGHUP"] as const;
+
+/**
+ * Best-effort flush on SIGTERM/SIGHUP.
+ *
+ * Crash insurance: pi fires session_shutdown on normal exit, but a host that
+ * does not forward signals to extensions (or an older pi) can skip it, so we
+ * register on SIGTERM/SIGHUP to flush+shutdown. Registering a listener
+ * replaces the signal's default termination, so once the flush finishes, if
+ * no other handler is left (current pi versions install their own), the
+ * signal is re-raised to restore default exit semantics. We deliberately do
+ * NOT register on 'exit' or 'beforeExit': 'beforeExit' re-arms the event loop
+ * when its async work schedules, looping indefinitely; 'exit' runs
+ * synchronously and cannot await the flush.
+ *
+ * Returns a detach function so callers can remove the handlers when the
+ * runtime is replaced (reload) without stacking a fresh pair of listeners.
+ */
+export function installSignalShutdown(
+  shutdown: () => Promise<void>,
+  proc: SignalCapableProcess = process,
+): () => void {
+  const listeners = SIGNALS.map((signal) => {
+    const listener = () => {
+      // Swallow a failed flush (e.g. hung collector) so the re-raise below
+      // still runs and no unhandled rejection surfaces.
+      void shutdown()
+        .catch(() => {})
+        .finally(() => {
+          proc.removeListener(signal, listener);
+          // If we were the last handler, the process would otherwise stay
+          // alive with termination replaced. Re-raise so the default action
+          // runs (exit code 143 on SIGTERM).
+          if (proc.listenerCount(signal) === 0) proc.kill(proc.pid, signal);
+        });
+    };
+    proc.on(signal, listener);
+    return { signal, listener } as const;
+  });
+  return () => {
+    for (const { signal, listener } of listeners) proc.removeListener(signal, listener);
+  };
+}
+
 export async function startRuntime(
   cfg: ResolvedConfig,
   opts: RuntimeOptions = {},
@@ -399,23 +452,6 @@ export async function startRuntime(
 
   let shutdownStarted = false;
 
-  // Crash insurance: pi fires session_shutdown on normal exit, but SIGTERM
-  // (container stop, IDE shutdown) and SIGHUP (closed terminal) can skip it.
-  // Register on those signals to flush+shutdown best-effort. We deliberately
-  // do NOT register on 'exit' or 'beforeExit': 'beforeExit' re-arms the event
-  // loop when its async work schedules, looping indefinitely; 'exit' runs
-  // synchronously and cannot await the flush, so it just adds noise.
-  // removeProcessHooks is exposed on the runtime so callers can detach the
-  // previous session's handlers when the runtime is replaced (reload) without
-  // a full shutdown; otherwise each reload stacks a fresh pair of listeners.
-  const onSignal = () => { void shutdown(); };
-  process.on("SIGTERM", onSignal);
-  process.on("SIGHUP", onSignal);
-  const removeProcessHooks = (): void => {
-    process.removeListener("SIGTERM", onSignal);
-    process.removeListener("SIGHUP", onSignal);
-  };
-
   const flush = async (): Promise<void> => {
     if (shutdownStarted) return;
     await Promise.allSettled([
@@ -435,6 +471,10 @@ export async function startRuntime(
     removeProcessHooks();
     await shutdownProviders(traceProvider, meterProvider, loggerProvider, cfg.shutdownTimeoutMs, health);
   };
+
+  // Registered after `shutdown` exists; the listeners only fire long after
+  // this function returns. See installSignalShutdown for the re-raise logic.
+  const removeProcessHooks = installSignalShutdown(shutdown);
 
   return {
     config: cfg,
