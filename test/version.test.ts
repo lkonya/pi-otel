@@ -1,5 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { extensionVersion } from "../src/version.ts";
 
 describe("extensionVersion", () => {
@@ -8,8 +9,11 @@ describe("extensionVersion", () => {
     assert.ok(typeof v === "string");
     assert.ok(v.length > 0, "version is non-empty");
     assert.match(v, /^\d+\.\d+\.\d+/, "looks like a semver");
-    // Must agree with the package.json in the repo root.
-    const pkg = require("/home/user/src/pi-otel/package.json") as { version: string };
+    // Must agree with the package.json in the repo root. Resolve relative to
+    // this file so the suite passes from any checkout path.
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
     assert.equal(v, pkg.version, "matches package.json version");
   });
 
