@@ -7,7 +7,10 @@ import type { ExportHealth, TelemetryRuntime } from "../src/sdk.ts";
 
 type CommandHandler = (args: unknown, ctx: ExtensionContext) => Promise<void>;
 
-function captureRegisterCommands(getRuntime: () => TelemetryRuntime | null): {
+function captureRegisterCommands(
+  getRuntime: () => TelemetryRuntime | null,
+  getTracker: () => { activeTraceId(): string | undefined } | null = () => null,
+): {
   commands: Record<string, { handler: CommandHandler }>;
   runStatus: () => Promise<string>;
 } {
@@ -17,7 +20,7 @@ function captureRegisterCommands(getRuntime: () => TelemetryRuntime | null): {
       commands[name] = def;
     },
   } as unknown as ExtensionAPI;
-  registerCommands(fakePi, getRuntime);
+  registerCommands(fakePi, getRuntime, getTracker);
 
   async function runStatus(): Promise<string> {
     const fakeCtx = { hasUI: false } as unknown as ExtensionContext;
@@ -67,6 +70,7 @@ const EXPECTED_LABELS = [
   "service.name",
   "captureContent",
   "sampleRatio",
+  "active trace id",
   "shutdown timeout",
   "spans accepted",
   "exported spans",
@@ -188,27 +192,25 @@ describe("otel-status command", () => {
   });
 });
 
+/** Capture the last headless console.log line a command prints. */
+function captureLog(fn: () => Promise<void>): Promise<string> {
+  const orig = console.log;
+  let captured = "";
+  return (async () => {
+    try {
+      console.log = (s: string) => { captured = s; };
+      await fn();
+    } finally {
+      console.log = orig;
+    }
+    return captured;
+  })();
+}
+
 describe("otel-flush and otel-test commands", () => {
   // These commands must work headless (hasUI: false). An earlier version
   // called ctx.ui.notify unconditionally in otel-flush/otel-test and would
   // throw when pi ran without a UI.
-  function captureLog(fn: () => Promise<void>): Promise<string> {
-    const fakeCtx = { hasUI: false } as unknown as ExtensionContext;
-    const orig = console.log;
-    let captured = "";
-    return (async () => {
-      try {
-        console.log = (s: string) => { captured = s; };
-        await fn();
-      } finally {
-        console.log = orig;
-      }
-      // otel-test may emit multiple lines (warning prefix); keep the last.
-      void fakeCtx;
-      return captured;
-    })();
-  }
-
   test("otel-flush does not throw headless and prints a confirmation", async () => {
     let flushed = false;
     const rt = minimalRuntime({}, { spansExported: 0, metricBatchesExported: 0, logRecordsExported: 0 } as Partial<ExportHealth>);
@@ -255,5 +257,66 @@ describe("otel-status export counts", () => {
     );
     const out = await runStatus();
     assert.match(out, /exported spans\s+7$/m);
+  });
+});
+
+describe("otel-test health reporting", () => {
+  const fakeTracer = () => ({
+    startSpan: () => ({ addEvent() {}, setAttribute() {}, end() {} }),
+  });
+
+  test("reports flushed deltas on success", async () => {
+    const rt = minimalRuntime({}, { spansExported: 3, metricBatchesExported: 1, logRecordsExported: 2 });
+    rt.tracer = fakeTracer() as unknown as TelemetryRuntime["tracer"];
+    rt.logger = null;
+    rt.flush = async () => {
+      rt.health.spansExported = 4;
+      rt.health.metricBatchesExported = 2;
+      rt.health.logRecordsExported = 3;
+    };
+    const { commands } = captureRegisterCommands(() => rt);
+    const out = await captureLog(() => commands["otel-test"]!.handler([], { hasUI: false } as unknown as ExtensionContext));
+    assert.match(out, /self-test flushed \(spans \+1, metric batches \+1, log records \+1\)/);
+    assert.doesNotMatch(out, /ERROR/, "no errors on success");
+  });
+
+  test("surfaces export errors as a warning", async () => {
+    const rt = minimalRuntime({}, { tracesError: "connection refused" });
+    rt.tracer = fakeTracer() as unknown as TelemetryRuntime["tracer"];
+    rt.logger = null;
+    rt.flush = async () => {};
+    const { commands } = captureRegisterCommands(() => rt);
+    const out = await captureLog(() => commands["otel-test"]!.handler([], { hasUI: false } as unknown as ExtensionContext));
+    assert.match(out, /WARNING: pi-otel: self-test flushed .*traces: connection refused/);
+  });
+
+  test("emits the log record regardless of selfLogs", async () => {
+    // selfLogs gates lifecycle chatter, not an explicit pipeline check.
+    const rt = minimalRuntime({ selfLogs: false }, {});
+    rt.tracer = fakeTracer() as unknown as TelemetryRuntime["tracer"];
+    const emitted: Array<Record<string, unknown>> = [];
+    rt.logger = { emit: (rec: Record<string, unknown>) => { emitted.push(rec); } } as unknown as TelemetryRuntime["logger"];
+    rt.flush = async () => {};
+    const { commands } = captureRegisterCommands(() => rt);
+    await captureLog(() => commands["otel-test"]!.handler([], { hasUI: false } as unknown as ExtensionContext));
+    assert.equal(emitted.length, 1, "self-test log emitted despite selfLogs=false");
+    assert.match(String((emitted[0] as { attributes?: Record<string, unknown> } | undefined)?.attributes?.["event.name"]), /pi\.otel\.self_test/);
+  });
+});
+
+describe("otel-status active trace id", () => {
+  test("renders the tracker's active trace id", async () => {
+    const { runStatus } = captureRegisterCommands(
+      () => minimalRuntime({}, {}),
+      () => ({ activeTraceId: () => "abc123def45789" }),
+    );
+    const out = await runStatus();
+    assert.match(out, /active trace id\s+abc123def45789/);
+  });
+
+  test("renders (none) without a tracker", async () => {
+    const { runStatus } = captureRegisterCommands(() => minimalRuntime({}, {}), () => null);
+    const out = await runStatus();
+    assert.match(out, /active trace id\s+\(none\)/);
   });
 });

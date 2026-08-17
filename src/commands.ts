@@ -8,9 +8,14 @@ import { SeverityNumber } from "@opentelemetry/api-logs";
 import { emitLog } from "./logging.js";
 import { extensionVersion } from "./version.js";
 
-// (ATTR_TEST_FLAG removed — use the literal "pi.test" inline.)
+/** Structural tracker surface the status command needs (avoids a tracker import). */
+type TraceIdSource = { activeTraceId(): string | undefined };
 
-export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRuntime | null): void {
+export function registerCommands(
+  pi: ExtensionAPI,
+  getRuntime: () => TelemetryRuntime | null,
+  getTracker: () => TraceIdSource | null = () => null,
+): void {
   // console.log in headless, ctx.ui.notify in the TUI. Keeps /otel-* usable
   // both ways without each handler repeating the guard.
   const notify = (ctx: ExtensionContext, msg: string, level: "info" | "warning"): void => {
@@ -27,6 +32,7 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
       }
       const c = rt.config;
       const h = rt.health;
+      const traceId = getTracker()?.activeTraceId();
       const lines = [
         `enabled            ${c.enabled}`,
         `endpoint           ${c.endpoint}`,
@@ -40,6 +46,7 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
         `service.name       ${c.serviceName}`,
         `captureContent     ${c.captureContent}`,
         `sampleRatio        ${c.sampleRatio}`,
+        `active trace id    ${traceId || "(none)"}`,
         `shutdown timeout   ${c.shutdownTimeoutMs}`,
         `spans accepted     ${h.spansAccepted}`,
         `exported spans     ${h.spansExported}${h.spansAccepted > h.spansExported ? `  (${h.spansAccepted - h.spansExported} unexported)` : ""}`,
@@ -75,6 +82,13 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
         return;
       }
       const c = rt.config;
+      // Snapshot counts by value: exporter callbacks mutate the live health
+      // object during the flush, so a reference copy would zero the deltas.
+      const h0 = {
+        spansExported: rt.health.spansExported,
+        metricBatchesExported: rt.health.metricBatchesExported,
+        logRecordsExported: rt.health.logRecordsExported,
+      };
       // --- Trace ---
       if (c.traces.enabled) {
         const span = rt.tracer.startSpan("pi.otel.self_test", {
@@ -94,20 +108,33 @@ export function registerCommands(pi: ExtensionAPI, getRuntime: () => TelemetryRu
         counter?.add(1, { source: "otel-test" });
       }
       // --- Log ---
-      if (c.logs.enabled && c.selfLogs) {
+      // Explicit user action: emit regardless of selfLogs so the self-test
+      // always exercises all enabled signals.
+      if (c.logs.enabled && rt.logger) {
         emitLog(rt.logger, "pi.otel.self_test", SeverityNumber.INFO, "pi-otel self-test log record", {
           "pi.test": true,
         });
       }
       await rt.flush();
+      // Report what actually shipped, not just what was emitted: read the
+      // export counters around the flush so a dead endpoint is visible here.
+      const h = rt.health;
+      const shipped = `spans +${h.spansExported - h0.spansExported}, metric batches +${h.metricBatchesExported - h0.metricBatchesExported}, log records +${h.logRecordsExported - h0.logRecordsExported}`;
+      const errors = [
+        h.tracesError ? `traces: ${h.tracesError}` : null,
+        h.metricsError ? `metrics: ${h.metricsError}` : null,
+        h.logsError ? `logs: ${h.logsError}` : null,
+      ].filter((e): e is string => e !== null);
       const ok = c.traces.enabled || c.metrics.enabled || c.logs.enabled;
-      notify(
-        ctx,
-        ok
-          ? `pi-otel: emitted self-test (traces=${c.traces.enabled}, metrics=${c.metrics.enabled}, logs=${c.logs.enabled}). Check your backend.`
-          : "pi-otel: all signals disabled",
-        ok ? "info" : "warning",
-      );
+      if (!ok) {
+        notify(ctx, "pi-otel: all signals disabled", "warning");
+        return;
+      }
+      if (errors.length > 0) {
+        notify(ctx, `pi-otel: self-test flushed (${shipped}) with export errors: ${errors.join("; ")}`, "warning");
+      } else {
+        notify(ctx, `pi-otel: self-test flushed (${shipped}). Check your backend.`, "info");
+      }
     },
   });
 }

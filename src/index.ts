@@ -88,7 +88,7 @@ export default function (pi: ExtensionAPI): void {
   /** Serializes session start/stop so concurrent session_start cannot double-build a runtime. */
   let lifecycle: Promise<void> = Promise.resolve();
 
-  registerCommands(pi, () => runtime);
+  registerCommands(pi, () => runtime, () => tracker);
 
   // pi-otel:log — cross-extension log channel. Best-effort; no-op when logs
   // are disabled or the runtime isn't up yet. Payloads are untrusted and get
