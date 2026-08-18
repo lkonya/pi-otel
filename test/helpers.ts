@@ -82,6 +82,7 @@ export function harnessConfig(overrides: Partial<ResolvedConfig> = {}): Resolved
     metrics: { enabled: true },
     logs: { enabled: true },
     sampler: "parentbased_traceidratio",
+    semconv: "1.37",
     tracesExportTimeoutMs: 10000,
     metricsExportTimeoutMs: 10000,
     logsExportTimeoutMs: 10000,
@@ -104,7 +105,9 @@ export function harnessConfig(overrides: Partial<ResolvedConfig> = {}): Resolved
   };
 }
 
-export function makeHarness(opts: { captureContent?: "metadata_only" | "no_tool_content" | "full" } = {}): Harness {
+export function makeHarness(
+  opts: { captureContent?: "metadata_only" | "no_tool_content" | "full"; semconv?: "1.36" | "1.37" } = {},
+): Harness {
   const captureContent = opts.captureContent ?? "full";
 
   const spanExporter = new InMemorySpanExporter();
@@ -119,6 +122,7 @@ export function makeHarness(opts: { captureContent?: "metadata_only" | "no_tool_
   const tracker = new SpanTracker({
     tracer,
     captureContent,
+    semconv: opts.semconv ?? "1.37",
     sessionId: () => "test-session",
     sessionFile: () => "/tmp/test.jsonl",
     cwd: "/test",

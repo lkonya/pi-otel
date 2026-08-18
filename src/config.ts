@@ -27,6 +27,14 @@ export type SamplerSpec =
   | "traceidratio"
   | "parentbased_traceidratio";
 
+/** GenAI attribute dialect, versioned by the opentelemetry/semantic-conventions
+ * release that defined the attribute set. `1.36` is the pre-2025-10 set
+ * (`gen_ai.system`, message span events). `1.37` is the 2025-10 rework
+ * (`gen_ai.provider.name`, no message events). */
+export type SemconvDialect = "1.36" | "1.37";
+
+export const DEFAULT_SEMCONV: SemconvDialect = "1.37";
+
 export interface SignalConfig {
   enabled: boolean;
 }
@@ -68,6 +76,8 @@ export interface ResolvedConfig {
   logs: SignalConfig;
   /** Sampler selection per OTEL_TRACES_SAMPLER. Default parentbased_traceidratio. */
   sampler: SamplerSpec;
+  /** GenAI convention version. Default 1.37. */
+  semconv: SemconvDialect;
   /** Exporter request timeout per signal, ms. Spec default 10000. */
   tracesExportTimeoutMs: number;
   metricsExportTimeoutMs: number;
@@ -115,6 +125,7 @@ interface SettingsOtel {
   metrics: boolean;
   logs: boolean;
   sampler?: SamplerSpec;
+  semconv?: SemconvDialect;
   tracesExportTimeoutMs?: number;
   metricsExportTimeoutMs?: number;
   logsExportTimeoutMs?: number;
@@ -265,6 +276,14 @@ const SAMPLER_SPECS: ReadonlySet<string> = new Set([
 export function normalizeSampler(v: string | undefined): SamplerSpec {
   const p = (v ?? "").trim().toLowerCase();
   return SAMPLER_SPECS.has(p) ? (p as SamplerSpec) : "parentbased_traceidratio";
+}
+
+/** Validate the semconv version; unknown values fall back to the default. */
+export function normalizeSemconv(v: string | undefined): SemconvDialect {
+  const p = (v ?? "").trim().toLowerCase();
+  if (p === "1.36") return "1.36";
+  if (p === "1.37") return "1.37";
+  return DEFAULT_SEMCONV;
 }
 
 function normalizeProtocol(v: string | undefined): Protocol {
@@ -430,6 +449,7 @@ export function resolveConfig(cwd: string): ResolvedConfig {
     metrics: { enabled: envBool(["PI_OTEL_METRICS"], s.metrics ?? true) },
     logs: { enabled: envBool(["PI_OTEL_LOGS"], s.logs ?? true) },
     sampler: normalizeSampler(envStr("OTEL_TRACES_SAMPLER") ?? s.sampler),
+    semconv: normalizeSemconv(envStr("PI_OTEL_SEMCONV") ?? s.semconv),
     tracesExportTimeoutMs: signalTimeout("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", s.tracesExportTimeoutMs),
     metricsExportTimeoutMs: signalTimeout("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT", s.metricsExportTimeoutMs),
     logsExportTimeoutMs: signalTimeout("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", s.logsExportTimeoutMs),

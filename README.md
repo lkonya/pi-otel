@@ -22,15 +22,20 @@ The LLM span is a `CLIENT` span carrying the GenAI semantic conventions. Backend
 
 Tool spans sit as siblings of the LLM span under the turn. Tools run after the model returns, so parenting them under the LLM span would misrepresent causality. Each tool span carries a span link back to the LLM span that triggered it, so backends that render links recover the causality without distorting timing. Several other agent exporters parent tools under the model call.
 
-**Metrics** use the GenAI semconv names where they exist:
+**Metrics** split by whether a released convention actually defines the name:
+
+`gen_ai.client.operation.duration` and `gen_ai.client.token.usage` are the only client-side metrics in every released GenAI convention set (verified against semantic-conventions v1.28 through v1.37), so they carry the semconv names:
 
 - `gen_ai.client.operation.duration` (histogram, seconds)
-- `gen_ai.client.time_to_first_token` (histogram, seconds; gap between request start and the first streamed assistant token)
-- `gen_ai.client.time_to_completion` (histogram, seconds; gap between request start and the last streamed assistant token, sourced from the `message_end` event)
 - `gen_ai.client.token.usage` (histogram, by `gen_ai.token.type`: input, output, cache_read, cache_write, cache_write_1h, reasoning)
-- `gen_ai.client.tool.calls` (counter)
 
-Plus a small `pi.*` set for things no semconv covers: `pi.session.duration`, `pi.prompt.count`, `pi.turn.count`, `pi.provider.retries`, `pi.turn.cancellations`, `pi.compaction.count`.
+The timing and tool-count instruments measure things no released convention covers, so they live under `pi.*` instead of claiming an alignment that does not exist:
+
+- `pi.llm.time_to_first_token` (histogram, seconds; gap between request start and the first streamed assistant token)
+- `pi.llm.time_to_completion` (histogram, seconds; gap between request start and the last streamed assistant token, sourced from the `message_end` event)
+- `pi.tool.calls` (counter)
+
+Plus the rest of the `pi.*` set: `pi.session.duration`, `pi.prompt.count`, `pi.turn.count`, `pi.provider.retries`, `pi.turn.cancellations`, `pi.compaction.count`. When the `semantic-conventions-genai` repository cuts tagged releases, a dated `semconv` dialect will adopt its names (`gen_ai.client.operation.time_to_first_chunk`, `gen_ai.execute_tool.duration`, the `gen_ai.invoke_agent.*` set) in one move.
 
 Token usage uses a histogram. The semconv is explicit about this. Histograms let the backend show the p50 and p95 token distribution per request, which a counter cannot.
 
@@ -72,9 +77,11 @@ Token usage uses a histogram. The semconv is explicit about this. Histograms let
 
 **Strongly typed against Pi's real event and message shapes.** `src/tracker.ts` mirrors Pi's `Usage`, `AssistantMessage`, `ToolResult`, and `ToolCall` types as structural types instead of reconstructing them with `as any`. Type errors catch drift across Pi versions at compile time, and the runtime tolerates added fields.
 
-**Tunable head sampling.** Sampling defaults to 1.0, every span exported. Set `PI_OTEL_SAMPLE_RATIO` or `OTEL_TRACES_SAMPLER_ARG` below 1.0 to cap ingest cost on a hosted platform without losing representative traffic.
+**Tunable head sampling.** Sampling defaults to 1.0, every span exported. Set `PI_OTEL_SAMPLE_RATIO` or `OTEL_TRACES_SAMPLER_ARG` below 1.0 to cap ingest cost on a hosted platform without losing representative traffic. `OTEL_TRACES_SAMPLER` selects the sampler: `parentbased_traceidratio` (default), `traceidratio`, `always_on`, or `always_off`.
 
-**Built-in pipeline diagnostics.** `/otel-status` prints the resolved config, per-signal endpoints, the last export error from each signal, and counts of exported span, metric, and log batches. `/otel-flush` force-flushes pending telemetry. `/otel-test` emits one synthetic span, one metric, and one log record so you can verify the backend receives all three signals in one step.
+**Speaks the current GenAI conventions, versioned.** The GenAI semantic conventions renamed `gen_ai.system` to `gen_ai.provider.name` and moved away from the message span events in semantic-conventions v1.37.0 (October 2025). The default `1.37` dialect emits the renamed set: backends that track the conventions render model calls with no extra setup, and captured content ships once per span in the JSON message attributes instead of three times. Pin `semconv` to `1.36` (env `PI_OTEL_SEMCONV=1.36`) when a backend still reads the pre-rename keys; each dialect emits exactly its own attribute set, with no dual-write.
+
+**Built-in pipeline diagnostics.** `/otel-status` prints the resolved config, per-signal endpoints, the active trace id, the last export error from each signal, and accepted vs exported span and log counts (an unexported hint means the batch queue is backed up or exports are failing). `/otel-flush` force-flushes pending telemetry. `/otel-test` emits one synthetic span, metric, and log record, force-flushes, and reports what actually shipped plus any export errors, so you can verify the backend receives all three signals in one step.
 
 **A log channel for your other extensions.** Any pi extension can route structured log records through this exporter with `pi.events.emit("pi-otel:log", ...)`. One observability pipeline for your whole setup.
 
@@ -151,6 +158,7 @@ Sources, highest precedence first:
     "serviceName": "pi",
     "resourceAttributes": { "deployment.env": "dev" },
     "captureContent": "full",
+    "semconv": "1.37",
     "sampleRatio": 1.0,
     "metricExportInterval": 10000,
     "tracesExportInterval": 5000,
@@ -167,17 +175,17 @@ Sources, highest precedence first:
 }
 ```
 
-`protocol` accepts `grpc`, `http/protobuf`, or `http/json`. `captureContent` accepts `metadata_only`, `no_tool_content`, or `full`; unrecognized values resolve to `metadata_only`, and an unset value defaults to `full`. `sampleRatio` is a float in [0, 1]; 1.0 means no sampling. `selfLogs` controls whether the extension emits its own `pi.*` lifecycle log records. `diagLogLevel` routes the OpenTelemetry SDK's internal diagnostics to stderr (default `none`).
+`protocol` accepts `grpc`, `http/protobuf`, or `http/json`. `captureContent` accepts `metadata_only`, `no_tool_content`, or `full`; unrecognized values resolve to `metadata_only`, and an unset value defaults to `full`. `semconv` names the semantic-conventions release whose GenAI attribute set is emitted: `1.37` (default) writes `gen_ai.provider.name` (the 2025-10 rename of `gen_ai.system`) and drops the legacy message events, so captured prompts and completions ship once in the `gen_ai.input.messages`/`gen_ai.output.messages` attributes; `1.36` writes the pre-rename `gen_ai.system` key and the message span events for backends that have not migrated. `sampleRatio` is a float in [0, 1]; 1.0 means no sampling. `selfLogs` controls whether the extension emits its own `pi.*` lifecycle log records. `diagLogLevel` routes the OpenTelemetry SDK's internal diagnostics to stderr (default `none`).
 
 ### Environment variables
 
 Standard OTel, honored verbatim:
 
-`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER_ARG`, `OTEL_TRACES_EXPORT_INTERVAL`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_LOGS_EXPORT_INTERVAL`, and `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`. Metric temporality defaults to `DELTA` when `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` is unset, so cumulative counters from a short-lived agent run do not mislead backends. The preference is passed to the metric exporter constructor; process.env is not mutated. Set the env var yourself to override.
+`OTEL_SDK_DISABLED`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TIMEOUT` (and per-signal `_TRACES/_METRICS/_LOGS_TIMEOUT`), `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT`, `OTEL_BLP_SCHEDULE_DELAY`, `OTEL_BLP_MAX_QUEUE_SIZE`, `OTEL_BLP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLP_EXPORT_TIMEOUT`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`, `OTEL_TRACES_EXPORT_INTERVAL`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_LOGS_EXPORT_INTERVAL`, and `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`. Metric temporality defaults to `DELTA` when `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` is unset, so cumulative counters from a short-lived agent run do not mislead backends. The preference is passed to the metric exporter constructor; process.env is not mutated. Set the env var yourself to override. `OTEL_BSP_*` and `OTEL_BLP_*` bound the trace and log batch queues (schedule delay, queue size, export batch size, export timeout); the spec names win over `OTEL_TRACES_EXPORT_INTERVAL`/`OTEL_LOGS_EXPORT_INTERVAL` when both are set. `OTEL_TRACES_SAMPLER` selects `parentbased_traceidratio` (default), `traceidratio`, `always_on`, or `always_off`.
 
 Extension-specific:
 
-`PI_OTEL_ENABLED`, `PI_OTEL_DISABLED`, `PI_OTEL_CAPTURE_CONTENT`, `PI_OTEL_SAMPLE_RATIO`, `PI_OTEL_TRACES`, `PI_OTEL_METRICS`, `PI_OTEL_LOGS`, `PI_OTEL_SELF_LOGS`, `PI_OTEL_DIAG_LOG_LEVEL`, `PI_OTEL_SHUTDOWN_TIMEOUT_MS`. Per-signal exporter env vars `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, and `OTEL_LOGS_EXPORTER` accept `otlp`, `console`, and `none` (comma-separated).
+`PI_OTEL_ENABLED`, `PI_OTEL_DISABLED`, `PI_OTEL_CAPTURE_CONTENT`, `PI_OTEL_SAMPLE_RATIO`, `PI_OTEL_SEMCONV` (accepts `1.36` or `1.37`), `PI_OTEL_TRACES`, `PI_OTEL_METRICS`, `PI_OTEL_LOGS`, `PI_OTEL_SELF_LOGS`, `PI_OTEL_DIAG_LOG_LEVEL`, `PI_OTEL_SHUTDOWN_TIMEOUT_MS`. Per-signal exporter env vars `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER`, and `OTEL_LOGS_EXPORTER` accept `otlp`, `console`, and `none` (comma-separated).
 
 Per-signal exporter tokens and the `DELTA` metric default are described above. `tracesExportInterval` and `logsExportInterval` set each signal's batch processor `scheduledDelayMillis`. `metricExportInterval` sets the metric reader's export interval.
 
@@ -185,9 +193,9 @@ Per-signal exporter tokens and the `DELTA` metric default are described above. `
 
 | Command | What it does |
 |---|---|
-| `/otel-status` | Print the resolved config and export health: per-signal exporter lists, shutdown timeout, last error from each signal, last shutdown error, total spans exported, metric export batches, and total log records exported. |
+| `/otel-status` | Print the resolved config and export health: per-signal exporter lists, shutdown timeout, the active trace id, last error from each signal, last shutdown error, spans accepted vs exported (with an unexported hint when the batch queue is backed up), metric export batches, and log records accepted vs exported. |
 | `/otel-flush` | Force-flush pending telemetry to the backend. |
-| `/otel-test` | Emit one synthetic span, one metric, and one log record. Use it to verify the pipeline end to end. |
+| `/otel-test` | Emit one synthetic span, metric, and log record, flush, then report what actually shipped (export deltas) and surface any export errors. Use it to verify the pipeline end to end. |
 
 ## Cross-extension log channel
 

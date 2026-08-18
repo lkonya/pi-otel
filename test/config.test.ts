@@ -59,6 +59,7 @@ const ENV_KEYS = [
   "OTEL_BLP_MAX_QUEUE_SIZE",
   "OTEL_BLP_MAX_EXPORT_BATCH_SIZE",
   "OTEL_BLP_EXPORT_TIMEOUT",
+  "PI_OTEL_SEMCONV",
 ] as const;
 
 let saved: Record<string, string | undefined> = {};
@@ -637,5 +638,20 @@ describe("sampler selection", () => {
   test("unknown values fall back to the default", () => {
     process.env.OTEL_TRACES_SAMPLER = "some_custom_sampler";
     assert.equal(resolveConfig("/nonexistent").sampler, "parentbased_traceidratio");
+  });
+});
+
+describe("semconv dialect", () => {
+  test("defaults to 1.37", () => {
+    assert.equal(resolveConfig("/nonexistent").semconv, "1.37");
+  });
+
+  test("PI_OTEL_SEMCONV selects 1.36; unknown values fall back to 1.37", () => {
+    process.env.PI_OTEL_SEMCONV = "1.36";
+    assert.equal(resolveConfig("/nonexistent").semconv, "1.36");
+    process.env.PI_OTEL_SEMCONV = "latest";
+    assert.equal(resolveConfig("/nonexistent").semconv, "1.37", "old dialect names are gone");
+    process.env.PI_OTEL_SEMCONV = "1.38";
+    assert.equal(resolveConfig("/nonexistent").semconv, "1.37", "future versions fall back until supported");
   });
 });

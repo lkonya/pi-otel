@@ -24,6 +24,10 @@ import { createHash } from "node:crypto";
 export const GEN_AI_SYSTEM = "pi";
 
 export const ATTR_GEN_AI_SYSTEM = "gen_ai.system";
+/** Renamed from gen_ai.system in semantic-conventions v1.37.0 (2025-10).
+ * The 1.37 dialect emits this instead of gen_ai.system; each dialect emits
+ * exactly its own convention set, with no dual-write. */
+export const ATTR_GEN_AI_PROVIDER_NAME = "gen_ai.provider.name";
 export const ATTR_GEN_AI_AGENT_NAME = "gen_ai.agent.name";
 export const ATTR_GEN_AI_OPERATION_NAME = "gen_ai.operation.name";
 export const ATTR_GEN_AI_REQUEST_MODEL = "gen_ai.request.model";
@@ -105,10 +109,20 @@ export const spanToolName = (name: string): string => `pi.tool.${name}`;
 // Metric names
 // ---------------------------------------------------------------------------
 
-// GenAI semconv metrics
+// GenAI semconv metrics that exist in released conventions (verified against
+// semantic-conventions v1.28 through v1.37; the client metric set in every
+// release is exactly these two).
 export const METRIC_OP_DURATION = "gen_ai.client.operation.duration";
 export const METRIC_TOKEN_USAGE = "gen_ai.client.token.usage";
-export const METRIC_TOOL_CALLS = "gen_ai.client.tool.calls";
+
+// pi-namespaced metrics. gen_ai.client.time_to_first_token, time_to_completion,
+// and tool.calls were never part of any released convention set, so they live
+// under pi.* until the semantic-conventions-genai repo cuts tagged releases;
+// its main branch defines gen_ai.client.operation.time_to_first_chunk, which a
+// future dated dialect will adopt.
+export const METRIC_LLM_TTFT = "pi.llm.time_to_first_token";
+export const METRIC_LLM_TIME_TO_COMPLETION = "pi.llm.time_to_completion";
+export const METRIC_TOOL_CALLS = "pi.tool.calls";
 
 // pi-namespaced metrics
 export const METRIC_SESSION_DURATION = "pi.session.duration";

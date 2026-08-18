@@ -1,52 +1,66 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { basename } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
- * End-to-end integration test.
+ * End-to-end integration test over real OTLP/HTTP in the JSON protocol.
  *
- * Spins up a loopback OTLP/HTTP sink, loads the real index.ts extension
- * against a fake ExtensionAPI pointed at that sink, replays a realistic
- * session's event sequence, and asserts that the produced OTLP payloads
- * (traces, metrics, logs) actually arrive over HTTP with the expected span
- * names embedded.
+ * Spins up a loopback OTLP sink that parses every request body, loads the
+ * real index.ts extension against a fake ExtensionAPI pointed at that sink,
+ * replays a realistic session's event sequence, and asserts on the decoded
+ * OTLP payloads: span names, kinds, parent links, gen_ai.* attributes,
+ * metric names, and log event names. JSON (not protobuf) so assertions read
+ * real values instead of substring-scraping a binary blob.
  *
  * This is the highest-fidelity test short of running pi itself: it exercises
- * config -> sdk -> exporter -> HTTP -> our assertions, end to end.
+ * config -> sdk -> exporter -> HTTP -> parse -> assertions, end to end.
  */
 
 const SINK_PORT = 14318; // avoid 4318 in case the user has jaeger running
 const ENDPOINT = `http://127.0.0.1:${SINK_PORT}`;
 
 let server: Server;
-const received = { traces: [] as Buffer[], metrics: [] as Buffer[], logs: [] as Buffer[] };
+const received = {
+  traces: [] as unknown[],
+  metrics: [] as unknown[],
+  logs: [] as unknown[],
+};
 const savedEnv: Record<string, string | undefined> = {};
 const E2E_ENV_KEYS = [
   "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_PROTOCOL",
   "OTEL_METRIC_EXPORT_INTERVAL",
   "PI_OTEL_DISABLED",
+  "PI_OTEL_SEMCONV",
 ] as const;
 
 before(async () => {
   for (const k of E2E_ENV_KEYS) {
     savedEnv[k] = process.env[k];
   }
+  // JSON protocol for every e2e run so payloads parse into assertable values.
+  process.env.OTEL_EXPORTER_OTLP_PROTOCOL = "http/json";
   server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c as Buffer));
     req.on("end", () => {
-      const buf = Buffer.concat(chunks);
+      const body = Buffer.concat(chunks).toString("utf8");
       const url = req.url ?? "";
-      if (url.endsWith("/v1/traces")) received.traces.push(buf);
-      else if (url.endsWith("/v1/metrics")) received.metrics.push(buf);
-      else if (url.endsWith("/v1/logs")) received.logs.push(buf);
+      let parsed: unknown = { __parseError: body.slice(0, 200) };
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        // keep the marker; assertions below will fail loudly on it
+      }
+      if (url.endsWith("/v1/traces")) received.traces.push(parsed);
+      else if (url.endsWith("/v1/metrics")) received.metrics.push(parsed);
+      else if (url.endsWith("/v1/logs")) received.logs.push(parsed);
       // Connection: close forces the exporter's keep-alive agent to release the
       // socket after each export, so server.close() in after() can complete
       // instead of waiting on idle keep-alive connections forever.
-      res.writeHead(200, { "Content-Type": "application/x-protobuf", Connection: "close" });
-      res.end(Buffer.alloc(0));
+      res.writeHead(200, { "Content-Type": "application/json", Connection: "close" });
+      res.end("{}");
     });
   });
   await new Promise<void>((resolve) => server.listen(SINK_PORT, "127.0.0.1", resolve));
@@ -66,9 +80,77 @@ function resetReceived() {
   received.traces = []; received.metrics = []; received.logs = [];
 }
 
-/** Extract printable strings >= 6 chars from a (likely protobuf) buffer. */
-function stringsIn(buf: Buffer): string[] {
-  return (buf.toString("latin1").match(/[\x20-\x7e]{6,}/g) ?? []);
+// --- OTLP/JSON decoding helpers ----------------------------------------------
+
+interface OtlpAttribute { key: string; value: Record<string, unknown> }
+
+function attrValue(v: Record<string, unknown>): unknown {
+  if ("stringValue" in v) return v.stringValue;
+  if ("intValue" in v) return typeof v.intValue === "string" ? Number.parseInt(v.intValue, 10) : v.intValue;
+  if ("doubleValue" in v) return v.doubleValue;
+  if ("boolValue" in v) return v.boolValue;
+  if ("arrayValue" in v) {
+    const values = (v.arrayValue as { values?: Array<Record<string, unknown>> }).values ?? [];
+    return values.map((x) => attrValue(x));
+  }
+  if ("kvlistValue" in v) {
+    const values = (v.kvlistValue as { values?: OtlpAttribute[] }).values ?? [];
+    return attrsToRecord(values);
+  }
+  return undefined;
+}
+
+function attrsToRecord(attrs: OtlpAttribute[] | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const a of attrs ?? []) out[a.key] = attrValue(a.value);
+  return out;
+}
+
+interface DecodedSpan {
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  name: string;
+  kind: number;
+  attributes?: OtlpAttribute[];
+  events?: Array<{ name: string; attributes?: OtlpAttribute[] }>;
+  links?: Array<{ traceId: string; spanId: string }>;
+  status?: { code?: number };
+}
+
+/** Flatten every received trace payload into spans. */
+function allSpans(): DecodedSpan[] {
+  const spans: DecodedSpan[] = [];
+  for (const payload of received.traces) {
+    const rs = (payload as { resourceSpans?: Array<{ scopeSpans?: Array<{ spans?: DecodedSpan[] }> }> }).resourceSpans ?? [];
+    for (const r of rs) for (const s of r.scopeSpans ?? []) spans.push(...(s.spans ?? []));
+  }
+  return spans;
+}
+
+/** All log records across received payloads. */
+function allLogRecords(): Array<{ body?: { stringValue?: string }; severityText?: string; attributes?: OtlpAttribute[] }> {
+  const records: Array<{ body?: { stringValue?: string }; severityText?: string; attributes?: OtlpAttribute[] }> = [];
+  for (const payload of received.logs) {
+    const rl = (payload as { resourceLogs?: Array<{ scopeLogs?: Array<{ logRecords?: unknown[] }> }> }).resourceLogs ?? [];
+    for (const r of rl) for (const s of r.scopeLogs ?? []) records.push(...((s.logRecords ?? []) as Array<{ body?: { stringValue?: string }; severityText?: string; attributes?: OtlpAttribute[] }>));
+  }
+  return records;
+}
+
+/** All metric names across received payloads. */
+function allMetricNames(): string[] {
+  const names: string[] = [];
+  for (const payload of received.metrics) {
+    const rm = (payload as { resourceMetrics?: Array<{ scopeMetrics?: Array<{ metrics?: Array<{ name: string }> }> }> }).resourceMetrics ?? [];
+    for (const r of rm) for (const s of r.scopeMetrics ?? []) for (const m of s.metrics ?? []) names.push(m.name);
+  }
+  return names;
+}
+
+/** Raw joined JSON of all trace payloads, for coarse substring checks. */
+function traceBlob(): string {
+  return received.traces.map((t) => JSON.stringify(t)).join("");
 }
 
 // --- fake ExtensionAPI ------------------------------------------------------
@@ -98,7 +180,7 @@ function fakePi() {
   return { pi, handlers, commands, ctx };
 }
 
-describe("end-to-end over real HTTP OTLP", () => {
+describe("end-to-end over real HTTP OTLP (JSON protocol)", () => {
   test("a full prompt with a tool call exports traces, metrics, and logs", async () => {
     resetReceived();
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT = ENDPOINT;
@@ -114,19 +196,22 @@ describe("end-to-end over real HTTP OTLP", () => {
     await emit("session_start", { reason: "startup" });
     await emit("before_agent_start", { prompt: "read the file", systemPrompt: "" });
     await emit("agent_start", {});
+    // Turn 0: the model returns a tool call; pi executes the tool inside the
+    // turn (before turn_end), so the LLM span is still open and linkable.
     await emit("turn_start", { turnIndex: 0, timestamp: Date.now() });
     await emit("before_provider_request", { payload: {} });
     await emit("message_start", { message: { role: "user", content: "read the file" } });
     await emit("after_provider_response", { status: 200, headers: {} });
+    await emit("tool_execution_start", { toolCallId: "t1", toolName: "read", args: { path: "/x" } });
+    await emit("tool_execution_end", { toolCallId: "t1", toolName: "read", result: { out: "contents" }, isError: false });
     await emit("turn_end", {
       turnIndex: 0,
-      message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "/x" } }], model: "test-model", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } }, stopReason: "tool_use" },
+      message: { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "/x" } }], model: "test-model", usage: { input: 10, output: 5, cacheRead: 3, cacheWrite: 0, cost: { total: 0.001 } }, stopReason: "tool_use" },
       toolResults: [],
     });
+    // Turn 1: plain completion.
     await emit("turn_start", { turnIndex: 1, timestamp: Date.now() });
-    await emit("tool_execution_start", { toolCallId: "t1", toolName: "read", args: { path: "/x" } });
     await emit("before_provider_request", { payload: {} });
-    await emit("tool_execution_end", { toolCallId: "t1", toolName: "read", result: { out: "contents" }, isError: false });
     await emit("after_provider_response", { status: 200, headers: {} });
     await emit("turn_end", {
       turnIndex: 1,
@@ -136,26 +221,116 @@ describe("end-to-end over real HTTP OTLP", () => {
     await emit("agent_end", { messages: [] });
     await emit("session_shutdown", { reason: "quit" });
 
-    // Traces and logs export synchronously on shutdown; metrics on the 500ms tick.
     assert.ok(received.traces.length > 0, "traces exported");
     assert.ok(received.logs.length > 0, "logs exported");
-    // metrics may flush on shutdown's forceFlush
     assert.ok(received.metrics.length > 0, "metrics exported");
 
-    // The trace payload must contain the documented span names.
-    const allTraceStrings = received.traces.flatMap(stringsIn);
-    assert.ok(allTraceStrings.some(s => s.includes("pi.session")), "pi.session span");
-    assert.ok(allTraceStrings.some(s => s.includes("pi.interaction")), "pi.interaction span");
-    assert.ok(allTraceStrings.some(s => s.includes("pi.turn")), "pi.turn span");
-    assert.ok(allTraceStrings.some(s => s.includes("pi.llm_request")), "pi.llm_request span");
-    assert.ok(allTraceStrings.some(s => s.includes("pi.tool.read")), "pi.tool.read span");
-    // gen_ai.system attribute
-    assert.ok(allTraceStrings.some(s => s.includes("gen_ai.system")), "gen_ai.system attr");
-    assert.ok(allTraceStrings.some(s => s.includes("test-model")), "request model attr");
+    const spans = allSpans();
+    const byName = (name: string) => spans.filter((s) => s.name === name);
+    assert.ok(byName("pi.session").length >= 1, "pi.session span");
+    assert.ok(byName("pi.interaction").length >= 1, "pi.interaction span");
+    assert.ok(byName("pi.turn").length >= 2, "pi.turn spans");
+    assert.ok(byName("pi.llm_request").length >= 2, "pi.llm_request spans");
+    assert.ok(byName("pi.tool.read").length === 1, "pi.tool.read span");
 
-    // Logs must include the session lifecycle event.
-    const allLogStrings = received.logs.flatMap(stringsIn);
-    assert.ok(allLogStrings.some(s => s.includes("pi.session")), "session lifecycle log");
+    // Structure: the LLM span is a CLIENT span parented under the turn.
+    const llm = byName("pi.llm_request")[0]!;
+    assert.equal(llm.kind, 3, "llm_request is SpanKind.CLIENT (OTLP wire enum: 3) ");
+    const turns = byName("pi.turn");
+    assert.ok(
+      turns.some((t) => t.spanId === llm.parentSpanId),
+      "llm_request parented under a turn",
+    );
+    const interaction = byName("pi.interaction")[0]!;
+    assert.ok(
+      turns.some((t) => t.parentSpanId === interaction.spanId),
+      "turn parented under the interaction",
+    );
+
+    // gen_ai attributes on the LLM span, by value. Default dialect is 1.37:
+    // the renamed provider key, and the old key absent.
+    const llmAttrs = attrsToRecord(llm.attributes);
+    assert.equal(llmAttrs["gen_ai.provider.name"], "test");
+    assert.equal(llmAttrs["gen_ai.system"], undefined, "1.37 does not write the pre-rename key");
+    assert.equal(llmAttrs["gen_ai.request.model"], "test-model");
+    assert.equal(llmAttrs["gen_ai.usage.input_tokens"], 10);
+    assert.equal(llmAttrs["gen_ai.usage.output_tokens"], 5);
+    assert.equal(llmAttrs["gen_ai.usage.cache_read_input_tokens"], 3);
+    assert.deepEqual(llmAttrs["gen_ai.response.finish_reasons"], ["tool_use"]);
+
+    // The tool span links back to the LLM span that requested it.
+    const tool = byName("pi.tool.read")[0]!;
+    const toolAttrs = attrsToRecord(tool.attributes);
+    assert.equal(toolAttrs["gen_ai.tool.name"], "read");
+    assert.equal(toolAttrs["gen_ai.tool.call.id"], "t1");
+    assert.ok(
+      (tool.links ?? []).some((l) => l.spanId === llm.spanId),
+      "tool span links to the triggering LLM span",
+    );
+
+    // Session summary lands on the session span.
+    const sessionAttrs = attrsToRecord(byName("pi.session")[0]!.attributes);
+    assert.equal(sessionAttrs["gen_ai.usage.input_tokens"], 30, "session sums input tokens");
+    assert.equal(sessionAttrs["gen_ai.usage.cost_usd"] as number, 0.003, "session sums cost");
+
+    // Logs carry the lifecycle event with an event.name attribute.
+    const logRecords = allLogRecords();
+    const eventNames = logRecords.map((r) => attrsToRecord(r.attributes)["event.name"]);
+    assert.ok(eventNames.includes("pi.session.start"), "pi.session.start log");
+    assert.ok(eventNames.includes("pi.session.end"), "pi.session.end log");
+
+    // Metrics arrive with the spec-true semconv names plus the pi.* set.
+    const metricNames = allMetricNames();
+    assert.ok(metricNames.includes("gen_ai.client.operation.duration"), "operation duration metric");
+    assert.ok(metricNames.includes("pi.turn.count"), "turn count metric");
+    assert.ok(metricNames.includes("gen_ai.client.token.usage"), "token usage metric");
+    assert.ok(metricNames.includes("pi.tool.calls"), "tool calls metric");
+    assert.ok(!metricNames.some((n) => n.startsWith("gen_ai.client.") && ![
+      "gen_ai.client.operation.duration",
+      "gen_ai.client.token.usage",
+    ].includes(n)), "no invented gen_ai.client.* metric names");
+  });
+
+  test("semconv=1.36 restores the pre-rename attribute set and events", async () => {
+    resetReceived();
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = ENDPOINT;
+    process.env.PI_OTEL_SEMCONV = "1.36";
+    try {
+      const { pi, handlers, ctx } = fakePi();
+      const mod = await import("../src/index.ts");
+      mod.default(pi);
+      const emit = async (event: string, payload: any) => {
+        const h = handlers.get(event);
+        if (h) await h({ type: event, ...payload }, ctx);
+      };
+
+      await emit("session_start", { reason: "startup" });
+      await emit("before_agent_start", { prompt: "dialect check", systemPrompt: "" });
+      await emit("turn_start", { turnIndex: 0, timestamp: Date.now() });
+      await emit("before_provider_request", { payload: {} });
+      await emit("message_start", { message: { role: "user", content: "dialect check" } });
+      await emit("after_provider_response", { status: 200, headers: {} });
+      await emit("turn_end", {
+        turnIndex: 0,
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], model: "test-model", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, stopReason: "stop" },
+        toolResults: [],
+      });
+      await emit("agent_end", { messages: [] });
+      await emit("session_shutdown", { reason: "quit" });
+
+      const llm = allSpans().find((s) => s.name === "pi.llm_request")!;
+      assert.ok(llm, "llm span present");
+      const attrs = attrsToRecord(llm.attributes);
+      assert.equal(attrs["gen_ai.system"], "test", "pre-rename key present");
+      assert.equal(attrs["gen_ai.provider.name"], undefined, "renamed key absent in 1.36");
+      const eventNames = new Set((llm.events ?? []).map((e) => e.name));
+      assert.ok(eventNames.has("gen_ai.user.message"), "legacy user message event");
+      assert.ok(eventNames.has("gen_ai.assistant.message"), "legacy assistant message event");
+      assert.ok(eventNames.has("gen_ai.choice"), "legacy choice event");
+      assert.ok(attrs["gen_ai.input.messages"], "JSON input messages still present");
+    } finally {
+      delete process.env.PI_OTEL_SEMCONV;
+    }
   });
 
   test("session replacement does not error and still exports on shutdown", async () => {
@@ -215,8 +390,7 @@ describe("end-to-end over real HTTP OTLP", () => {
     await emit("session_shutdown", { reason: "new" });
     const afterA = received.traces.length;
     assert.ok(afterA > 0, "session A exported traces on non-quit shutdown");
-    const aBlob = received.traces.map(b => b.toString("latin1")).join("");
-    assert.ok(aBlob.includes("session-a") || aBlob.includes("pi.session"), "session A payload present");
+    assert.ok(traceBlob().includes("session-a"), "session A payload present");
 
     // After A is shut down, no further spontaneous exports should arrive.
     const mid = received.traces.length;
@@ -281,9 +455,12 @@ describe("end-to-end over real HTTP OTLP", () => {
 
     await emit("session_start", { reason: "startup" });
     await emit("before_agent_start", { prompt: "do a thing", systemPrompt: "" });
+    // Real loop order: the tool executes inside the turn that requested it.
     await emit("turn_start", { turnIndex: 0, timestamp: Date.now() });
     await emit("before_provider_request", { payload: {} });
     await emit("after_provider_response", { status: 500, headers: {} });
+    await emit("tool_execution_start", { toolCallId: "t1", toolName: "bash", args: {} });
+    await emit("tool_execution_end", { toolCallId: "t1", toolName: "bash", result: "err", isError: true });
     await emit("turn_end", {
       turnIndex: 0,
       message: {
@@ -294,19 +471,14 @@ describe("end-to-end over real HTTP OTLP", () => {
         stopReason: "tool_use",
       },
     });
-    await emit("turn_start", { turnIndex: 1, timestamp: Date.now() });
-    await emit("tool_execution_start", { toolCallId: "t1", toolName: "bash", args: {} });
-    await emit("tool_execution_end", { toolCallId: "t1", toolName: "bash", result: "err", isError: true });
     await emit("agent_end", { messages: [] });
     await emit("session_shutdown", { reason: "quit" });
 
     assert.ok(received.logs.length > 0, "logs exported");
-    const allLogStrings = received.logs.flatMap(stringsIn);
-    assert.ok(allLogStrings.some(s => s.includes("pi.session.start")), "pi.session.start");
-    assert.ok(allLogStrings.some(s => s.includes("pi.session.end")), "pi.session.end emitted on shutdown");
-    assert.ok(allLogStrings.some(s => s.includes("pi.llm_request.error")), "pi.llm_request.error on HTTP >=400");
-    assert.ok(allLogStrings.some(s => s.includes("pi.tool.error")), "pi.tool.error on failed tool");
+    const eventNames = allLogRecords().map((r) => attrsToRecord(r.attributes)["event.name"]);
+    assert.ok(eventNames.includes("pi.session.start"), "pi.session.start");
+    assert.ok(eventNames.includes("pi.session.end"), "pi.session.end emitted on shutdown");
+    assert.ok(eventNames.includes("pi.llm_request.error"), "pi.llm_request.error on HTTP >=400");
+    assert.ok(eventNames.includes("pi.tool.error"), "pi.tool.error on failed tool");
   });
 });
-
-void basename;

@@ -47,6 +47,7 @@ import {
   ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_OUTPUT_MESSAGES,
   ATTR_GEN_AI_OUTPUT_TOKENS,
+  ATTR_GEN_AI_PROVIDER_NAME,
   ATTR_GEN_AI_REASONING_TOKENS,
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_ID,
@@ -95,10 +96,15 @@ import {
   type ContentCapture,
 } from "./attrs.js";
 import type { Metrics } from "./metrics.js";
+import type { SemconvDialect } from "./config.js";
 
 export interface TrackerOptions {
   tracer: Tracer;
   captureContent: ContentCapture;
+  /** GenAI convention version. Default `1.37` (gen_ai.provider.name, no
+   * message span events). `1.36` emits the pre-2025-10 set (gen_ai.system
+   * plus the message events) for backends not yet migrated. */
+  semconv?: SemconvDialect;
   /** Lazy session id so the tracker doesn't need ctx at construction. */
   sessionId: () => string | undefined;
   sessionFile: () => string | undefined;
@@ -152,6 +158,7 @@ export type SessionReason = "startup" | "reload" | "new" | "resume" | "fork";
 
 export class SpanTracker {
   private opts: TrackerOptions;
+  private readonly semconv: SemconvDialect;
   private session: (Slot) | null = null;
   private interaction: (Slot) | null = null;
   private turn: (TimedSlot & { index: number }) | null = null;
@@ -203,6 +210,7 @@ export class SpanTracker {
 
   constructor(opts: TrackerOptions) {
     this.opts = opts;
+    this.semconv = opts.semconv ?? "1.37";
     this.now = opts.now ?? (() => Date.now());
     this.orphanTtlMs = opts.orphanTtlMs ?? 30 * 60 * 1000;
     this.setTimer = opts.setTimer ?? defaultSetTimer;
@@ -399,10 +407,14 @@ export class SpanTracker {
     const parent = this.turn?.ctx ?? this.interaction?.ctx ?? otelContext.active();
     const attrs = this.commonAttrs();
     attrs[ATTR_GEN_AI_OPERATION_NAME] = OP_NAME_CHAT;
-    // Agent identity is the harness (pi). Provider identity is gen_ai.system.
+    // Agent identity is the harness (pi). Provider identity is the dialect's
+    // provider key: gen_ai.provider.name in 1.37 (the 2025-10 rename,
+    // semantic-conventions v1.37.0), gen_ai.system in 1.36. Each dialect
+    // emits only its own key; a dialect that also wrote the other version's
+    // key would not be that version.
     attrs[ATTR_GEN_AI_AGENT_NAME] = GEN_AI_SYSTEM;
     if (providerSystem) {
-      attrs[ATTR_GEN_AI_SYSTEM] = providerSystem;
+      attrs[this.providerNameKey()] = providerSystem;
     }
     if (requestModel) attrs[ATTR_GEN_AI_REQUEST_MODEL] = requestModel;
     const span = this.opts.tracer.startSpan(
@@ -471,27 +483,32 @@ export class SpanTracker {
 
   private llmEventGenAiSystem(): Record<string, string> | undefined {
     const ps = this.llm?.providerSystem;
-    return ps ? { [ATTR_GEN_AI_SYSTEM]: ps } : undefined;
+    return ps ? { [this.providerNameKey()]: ps } : undefined;
   }
 
   private flushPendingInput(): void {
     if (!this.llm || this.pendingInput.length === 0) return;
+    const emitEvents = this.semconv === "1.36";
     for (const m of this.pendingInput) {
       if (m.role === "user") {
         if (!this.shouldCapturePrompt()) continue;
-        const attrs: Record<string, unknown> = { role: "user", ...this.llmEventGenAiSystem() };
-        attrs.content = clampAttr(m.text);
-        this.llm.span.addEvent(EVENT_GEN_AI_USER_MESSAGE, attrs as Attributes);
+        if (emitEvents) {
+          const attrs: Record<string, unknown> = { role: "user", ...this.llmEventGenAiSystem() };
+          attrs.content = clampAttr(m.text);
+          this.llm.span.addEvent(EVENT_GEN_AI_USER_MESSAGE, attrs as Attributes);
+        }
         this.llm.inputMessages.push({ role: "user", parts: [{ type: "text", content: m.text }] });
       } else if (this.shouldCaptureToolContent()) {
-        const attrs: Record<string, unknown> = {
-          role: "tool",
-          ...this.llmEventGenAiSystem(),
-          [ATTR_GEN_AI_TOOL_CALL_ID]: m.toolCallId ?? "",
-          ...(m.toolName ? { [ATTR_GEN_AI_TOOL_NAME]: m.toolName } : {}),
-          content: clampAttr(m.text),
-        };
-        this.llm.span.addEvent(EVENT_GEN_AI_TOOL_MESSAGE, attrs as Attributes);
+        if (emitEvents) {
+          const attrs: Record<string, unknown> = {
+            role: "tool",
+            ...this.llmEventGenAiSystem(),
+            [ATTR_GEN_AI_TOOL_CALL_ID]: m.toolCallId ?? "",
+            ...(m.toolName ? { [ATTR_GEN_AI_TOOL_NAME]: m.toolName } : {}),
+            content: clampAttr(m.text),
+          };
+          this.llm.span.addEvent(EVENT_GEN_AI_TOOL_MESSAGE, attrs as Attributes);
+        }
         this.llm.inputMessages.push({
           role: "tool",
           parts: [{ type: "tool_call_response", id: m.toolCallId, name: m.toolName, response: m.text }],
@@ -660,17 +677,24 @@ export class SpanTracker {
     const text = extractAssistantText(m);
     const toolCalls = extractToolCalls(m, this.shouldCaptureToolContent());
     if (this.shouldCapturePrompt()) {
-      const asstAttrs: Record<string, unknown> = { role: "assistant", ...this.llmEventGenAiSystem() };
-      if (text) asstAttrs.content = clampAttr(text);
-      if (toolCalls.length) asstAttrs["tool_calls"] = clampAttr(toolCalls);
-      this.llm.span.addEvent(EVENT_GEN_AI_ASSISTANT_MESSAGE, asstAttrs as Attributes);
-      const finish = m.stopReason ?? "stop";
-      this.llm.span.addEvent(EVENT_GEN_AI_CHOICE, {
-        ...this.llmEventGenAiSystem(),
-        index: 0,
-        finish_reason: finish,
-        message: clampAttr({ role: "assistant", content: text, tool_calls: toolCalls.length ? toolCalls : undefined }),
-      });
+      // The legacy message/choice events duplicate the JSON message
+      // attributes below, so the 1.37 dialect drops them: captured content
+      // ships once, in the attributes current backends read.
+      if (this.semconv === "1.36") {
+        const asstAttrs: Record<string, unknown> = { role: "assistant", ...this.llmEventGenAiSystem() };
+        if (text) asstAttrs.content = clampAttr(text);
+        if (toolCalls.length) asstAttrs["tool_calls"] = clampAttr(toolCalls);
+        this.llm.span.addEvent(EVENT_GEN_AI_ASSISTANT_MESSAGE, asstAttrs as Attributes);
+        const finish = m.stopReason ?? "stop";
+        // The choice event keeps only the decision metadata. An earlier
+        // version embedded the full message JSON, a third copy of the
+        // completion on the same span.
+        this.llm.span.addEvent(EVENT_GEN_AI_CHOICE, {
+          ...this.llmEventGenAiSystem(),
+          index: 0,
+          finish_reason: finish,
+        });
+      }
       // Aspire-style JSON message attributes (read by 9.x AI panel and others).
       if (this.llm.inputMessages.length > 0) {
         this.llm.span.setAttribute(ATTR_GEN_AI_INPUT_MESSAGES, clampAttr(this.llm.inputMessages));
@@ -820,6 +844,11 @@ export class SpanTracker {
   /** Tool args/results are captured only in full mode. */
   private shouldCaptureToolContent(): boolean {
     return this.opts.captureContent === "full";
+  }
+
+  /** The dialect's provider identity attribute key. */
+  private providerNameKey(): string {
+    return this.semconv === "1.36" ? ATTR_GEN_AI_SYSTEM : ATTR_GEN_AI_PROVIDER_NAME;
   }
 }
 

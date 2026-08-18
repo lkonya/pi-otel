@@ -128,13 +128,13 @@ describe("span tree shape", () => {
 });
 
 describe("common attributes", () => {
-  test("llm_request has gen_ai.system from provider; session omits gen_ai.system", async () => {
+  test("llm_request has gen_ai.provider.name from provider; session omits it", async () => {
     runHappyPath(h);
     await h.flush();
     const spans = h.spansByName();
-    assert.equal(h.span(SPAN_LLM_REQUEST).attributes[ATTR_GEN_AI_SYSTEM], "anthropic");
-    assert.equal(ATTR_GEN_AI_SYSTEM in h.span(SPAN_SESSION).attributes, false);
-    assert.equal(ATTR_GEN_AI_SYSTEM in h.span(SPAN_INTERACTION).attributes, false);
+    assert.equal(h.span(SPAN_LLM_REQUEST).attributes["gen_ai.provider.name"], "anthropic");
+    assert.equal("gen_ai.provider.name" in h.span(SPAN_SESSION).attributes, false);
+    assert.equal("gen_ai.provider.name" in h.span(SPAN_INTERACTION).attributes, false);
   });
 
   test("every span carries pi.session.id", async () => {
@@ -906,7 +906,7 @@ describe("defensive behavior", () => {
 });
 
 describe("gen_ai.system provider", () => {
-  test("LLM span sets gen_ai.system from provider and gen_ai.agent.name to pi", async () => {
+  test("LLM span sets gen_ai.provider.name from provider and gen_ai.agent.name to pi", async () => {
     h.tracker.startSession();
     h.tracker.startInteraction("p");
     h.tracker.startTurn(0);
@@ -917,7 +917,8 @@ describe("gen_ai.system provider", () => {
     h.tracker.endSession();
     await h.flush();
     const a = h.span(SPAN_LLM_REQUEST).attributes;
-    assert.equal(a[ATTR_GEN_AI_SYSTEM], "anthropic");
+    assert.equal(a["gen_ai.provider.name"], "anthropic");
+    assert.equal(a[ATTR_GEN_AI_SYSTEM], undefined, "pre-rename key not written in 1.37");
     assert.equal(a["gen_ai.agent.name"], "pi");
     assert.equal(ATTR_GEN_AI_SYSTEM in h.span(SPAN_SESSION).attributes, false);
   });
@@ -1276,5 +1277,79 @@ describe("orphan sweep", () => {
     const llm = exporter.getFinishedSpans().find(s => s.name === "pi.llm_request");
     assert.ok(llm, "LLM span ended by the sweep");
     assert.equal(llm!.attributes[ATTR_PI_ORPHANED], true);
+  });
+});
+
+// --- semconv dialect ----------------------------------------------------------
+
+describe("semconv dialect", () => {
+  function runCaptured(semconv: "1.36" | "1.37") {
+    const hx = makeHarness({ captureContent: "full", semconv });
+    hx.tracker.startSession();
+    hx.tracker.startInteraction("dialect-prompt");
+    hx.tracker.startTurn(0);
+    hx.tracker.startLlm("m", "anthropic");
+    hx.tracker.noteUserInput("dialect-prompt");
+    hx.tracker.completeLlm(asstMsg({ text: "dialect-completion", toolCalls: [{ id: "tc1", name: "read", arguments: { path: "/x" } }], stopReason: "tool_use" }));
+    hx.tracker.endTurn(); hx.tracker.endInteraction(); hx.tracker.endSession();
+    return hx;
+  }
+
+  test("1.37 writes gen_ai.provider.name and not gen_ai.system", async () => {
+    const hx = runCaptured("1.37");
+    await hx.flush();
+    const a = hx.span(SPAN_LLM_REQUEST).attributes;
+    assert.equal(a["gen_ai.provider.name"], "anthropic", "renamed attribute present");
+    assert.equal(a[ATTR_GEN_AI_SYSTEM], undefined, "old key not written: each dialect emits only its own set");
+  });
+
+  test("1.37 drops the legacy message and choice events but keeps JSON attrs", async () => {
+    const hx = runCaptured("1.37");
+    await hx.flush();
+    const llm = hx.span(SPAN_LLM_REQUEST);
+    const names = new Set(llm.events.map((e) => e.name));
+    assert.equal(names.has("gen_ai.user.message"), false, "no user message event");
+    assert.equal(names.has("gen_ai.assistant.message"), false, "no assistant message event");
+    assert.equal(names.has("gen_ai.choice"), false, "no choice event");
+    assert.ok(llm.attributes[ATTR_GEN_AI_INPUT_MESSAGES], "input JSON attr remains");
+    assert.ok(llm.attributes[ATTR_GEN_AI_OUTPUT_MESSAGES], "output JSON attr remains");
+    assert.ok(String(llm.attributes[ATTR_GEN_AI_INPUT_MESSAGES]).includes("dialect-prompt"), "content carried once");
+  });
+
+  test("1.36 keeps the old key and the events", async () => {
+    const hx = runCaptured("1.36");
+    await hx.flush();
+    const llm = hx.span(SPAN_LLM_REQUEST);
+    assert.equal(llm.attributes[ATTR_GEN_AI_SYSTEM], "anthropic", "pre-rename key");
+    assert.equal(llm.attributes["gen_ai.provider.name"], undefined, "no rename key in 1.36");
+    const names = new Set(llm.events.map((e) => e.name));
+    assert.ok(names.has("gen_ai.user.message"));
+    assert.ok(names.has("gen_ai.assistant.message"));
+    assert.ok(names.has("gen_ai.choice"));
+  });
+
+  test("1.36 choice event carries no message payload", async () => {
+    // The completion used to ship three times (assistant event, choice
+    // message payload, output JSON). The choice payload was pure duplication.
+    const hx = runCaptured("1.36");
+    await hx.flush();
+    const choice = hx.span(SPAN_LLM_REQUEST).events.find((e) => e.name === "gen_ai.choice");
+    assert.ok(choice);
+    assert.equal("message" in (choice?.attributes ?? {}), false, "choice carries no message payload");
+    assert.equal(choice?.attributes?.["finish_reason"], "tool_use");
+  });
+
+  test("default is 1.37 when no semconv is passed", async () => {
+    const hx = makeHarness({ captureContent: "full" });
+    hx.tracker.startSession();
+    hx.tracker.startInteraction("p");
+    hx.tracker.startTurn(0);
+    hx.tracker.startLlm("m", "anthropic");
+    hx.tracker.completeLlm(asstMsg({ text: "t", stopReason: "stop" }));
+    hx.tracker.endTurn(); hx.tracker.endInteraction(); hx.tracker.endSession();
+    await hx.flush();
+    const a = hx.span(SPAN_LLM_REQUEST).attributes;
+    assert.equal(a["gen_ai.provider.name"], "anthropic", "1.37 is the default");
+    assert.equal(a[ATTR_GEN_AI_SYSTEM], undefined);
   });
 });

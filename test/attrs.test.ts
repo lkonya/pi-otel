@@ -153,3 +153,16 @@ describe("fingerprint", () => {
     assert.equal(fp.bytes, 3);
   });
 });
+
+describe("metric names", () => {
+  test("only spec-true client metrics carry gen_ai names", async () => {
+    const { METRIC_OP_DURATION, METRIC_TOKEN_USAGE, METRIC_LLM_TTFT, METRIC_LLM_TIME_TO_COMPLETION, METRIC_TOOL_CALLS } = await import("../src/attrs.ts");
+    // The client metric set in every released convention (v1.28 through
+    // v1.37) is exactly these two; anything else we emit lives under pi.*.
+    assert.equal(METRIC_OP_DURATION, "gen_ai.client.operation.duration");
+    assert.equal(METRIC_TOKEN_USAGE, "gen_ai.client.token.usage");
+    assert.equal(METRIC_LLM_TTFT, "pi.llm.time_to_first_token");
+    assert.equal(METRIC_LLM_TIME_TO_COMPLETION, "pi.llm.time_to_completion");
+    assert.equal(METRIC_TOOL_CALLS, "pi.tool.calls");
+  });
+});

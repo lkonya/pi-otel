@@ -141,6 +141,7 @@ export default function (pi: ExtensionAPI): void {
       tracker = new SpanTracker({
         tracer: next.tracer,
         captureContent: cfg.captureContent,
+        semconv: cfg.semconv,
         sessionId,
         sessionFile,
         cwd: ctx.cwd,
