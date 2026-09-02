@@ -116,9 +116,32 @@ export default function (pi: ExtensionAPI): void {
       return undefined;
     }
   };
+  /**
+   * Extract the plain-UUID session id from a session-file basename.
+   *
+   * Pi's session file convention is `<timestamp>_<uuid>.jsonl` for interactive
+   * sessions. Emitting the plain UUID everywhere (matching `getSessionId()` and
+   * pi's own `PI_SESSION_ID` env) keeps `pi.session.id` and `pi.session.parent_id`
+   * on the same format so join queries work uniformly. If the stem doesn't
+   * contain a canonical UUID at the end (unusual filename shape), return it
+   * unchanged to preserve backward-compatible behavior.
+   */
+  const extractSessionId = (stem: string): string => {
+    const m = stem.match(/(?:^|_)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+    return m?.[1] ?? stem;
+  };
   const sessionId = () => {
+    try {
+      // Pi's SessionManager.getSessionId() is the canonical source and matches
+      // process.env.PI_SESSION_ID. Prefer it: subagent-spawned children have
+      // session files named .../<runId>/run-N/session.jsonl, so a bare basename
+      // would yield the literal string "session".
+      const id = lastCtx?.sessionManager?.getSessionId?.();
+      if (id) return id;
+    } catch { /* fall through to file-based derivation */ }
     const f = sessionFile();
-    return f ? basename(f, ".jsonl") : undefined;
+    if (!f) return undefined;
+    return extractSessionId(basename(f, ".jsonl"));
   };
 
   const clearAbortListener = (): void => {
@@ -179,8 +202,11 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_start", async (event, ctx) => {
     lastCtx = ctx;
     const parentId = event.previousSessionFile
-      ? basename(event.previousSessionFile, ".jsonl")
-      : undefined;
+      ? extractSessionId(basename(event.previousSessionFile, ".jsonl"))
+      : // Subagent-spawned children start with reason=startup and no
+        // previousSessionFile. Publishers (e.g. pi-subagents) set an env
+        // var; consume it here so pi.session.parent_id links the tree.
+        process.env.PI_OTEL_PARENT_SESSION_ID || process.env.PI_SUBAGENT_PARENT_SESSION || undefined;
     await start(ctx, event.reason, parentId);
     if (cfg.selfLogs && runtime) {
       emitLog(
